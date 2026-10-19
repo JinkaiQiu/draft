@@ -51,7 +51,12 @@ def find_latest_checkpoint(log_dir: str | Path, run_name: str) -> Path:
 
     latest_run = max(run_dirs, key=lambda d: d.stat().st_mtime)
 
-    checkpoints = list(latest_run.glob("model_*.pt"))
+    published = latest_run / "model_latest.pt"
+    if published.is_file():
+        return published
+
+    checkpoints = [path for path in latest_run.glob("model_*.pt")
+                   if path.stem.removeprefix("model_").isdigit()]
     if not checkpoints:
         raise FileNotFoundError(f"No model_*.pt checkpoints found in {latest_run}")
 

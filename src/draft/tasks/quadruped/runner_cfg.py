@@ -71,6 +71,8 @@ class QuadrupedLocomotionRunnerCfg:
 
     # ── Reward weight overrides applied after env_cfg is built ────────────────
     reward_overrides: dict = field(default_factory=dict)
+    # Optional optimized-geometry special case of this same task.
+    codesign: dict | None = None
 
     # ─────────────────────────────────────────────────────────────────────────
     def apply_overrides(self, overrides: dict) -> None:
@@ -145,6 +147,10 @@ class QuadrupedLocomotionRunnerCfg:
         cfg_dict["algorithm"].setdefault("symmetry_cfg", None)
         cfg_dict["algorithm"].setdefault("share_cnn_encoders", False)
         cfg_dict["algorithm"].pop("multi_gpu_cfg", None)
+        conditioning = self.env_kwargs.get("morphology_conditioning", False)
+        if conditioning is True or isinstance(conditioning, dict):
+            for name in ("actor", "critic"):
+                cfg_dict[name]["class_name"] = "draft.codesign.models:ConditionedMLPModel"
         return cfg_dict
 
 

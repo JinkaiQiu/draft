@@ -18,6 +18,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import mujoco
+import numpy as np
 
 # Geometry and speed limits that need no simulator, so a laptop can check them.
 from draft.tasks.quadruped.speed_limits import (  # noqa: F401
@@ -134,16 +135,27 @@ def _stance_height(model: mujoco.MjModel, data: mujoco.MjData, k: float) -> floa
 
 
 def default_stance(xml_path: Path | str,
-                   stance_xml: Path | str | None = None) -> dict[str, float]:
+                   stance_xml: Path | str | None = None, *,
+                   model: mujoco.MjModel | None = None,
+                   stance_model: mujoco.MjModel | None = None) -> dict[str, float]:
     """The nominal crouch for this robot: ``knee = -k``, ``hip_pitch = k/2``.
 
     ``k`` is ``_NOMINAL_CROUCH`` clamped so every joint keeps
     ``_STANCE_HEADROOM`` from its soft limits (e.g. a Go2's knee range forces it).
+    Supplied models must match their XMLs and are read without modification.
     """
     # The stance is the action-space zero, so compared robots must share it;
     # ``stance_xml`` adds a model whose limits also constrain it.
-    models = [mujoco.MjModel.from_xml_path(str(_resolve_robot_xml(Path(x))))
-              for x in ({xml_path} if stance_xml is None else {xml_path, stance_xml})]
+    xml_path = _resolve_robot_xml(Path(xml_path))
+    if model is None:
+        model = mujoco.MjModel.from_xml_path(str(xml_path))
+    models = [model]
+    if stance_xml is not None:
+        stance_path = _resolve_robot_xml(Path(stance_xml))
+        if stance_path.resolve() != xml_path.resolve():
+            if stance_model is None:
+                stance_model = mujoco.MjModel.from_xml_path(str(stance_path))
+            models.append(stance_model)
 
     # Feasible for EVERY model in the set: intersect their bounds.
     k_min, k_max = 0.0, float("inf")
@@ -152,7 +164,6 @@ def default_stance(xml_path: Path | str,
         hip_lo, hip_hi = _soft_range(model, "fl_hip_pitch")
         k_min = max(k_min, -knee_hi + _STANCE_HEADROOM, 2.0 * (hip_lo + _STANCE_HEADROOM))
         k_max = min(k_max, -knee_lo - _STANCE_HEADROOM, 2.0 * (hip_hi - _STANCE_HEADROOM))
-    xml_path = _resolve_robot_xml(Path(xml_path))
     if k_max <= k_min:
         k = max(0.5 * (k_min + k_max), 0.0)
         warnings.warn(
@@ -189,6 +200,7 @@ def _velocity_limits_from_xml(model: mujoco.MjModel) -> dict[str, float]:
 
 def _actuator_cfgs_from_xml(
     xml_path: Path,
+    *, model: mujoco.MjModel | None = None,
 ) -> tuple[DcMotorActuatorCfg | BuiltinPositionActuatorCfg, ...]:
     """Derive DcMotorActuatorCfg groups (torque-speed model) from the robot XML.
 
@@ -196,7 +208,8 @@ def _actuator_cfgs_from_xml(
     identical parameters are merged. Efforts come from ``<actuator>`` elements,
     else from joint ``actuatorfrcrange``.
     """
-    model = mujoco.MjModel.from_xml_path(str(xml_path))
+    if model is None:
+        model = mujoco.MjModel.from_xml_path(str(xml_path))
     vel_limits = _velocity_limits_from_xml(model)
 
     joints: list[tuple[str, float]] = []
@@ -267,6 +280,9 @@ def make_quadruped_entity_cfg(
     init_height: float | None = None,
     stance_xml: Path | str | None = None,
     geom_group: int | None = None,
+    *,
+    model: mujoco.MjModel | None = None,
+    stance_model: mujoco.MjModel | None = None,
 ) -> EntityCfg:
     """Create an EntityCfg for the parametric quadruped from its robot XML.
 
@@ -275,12 +291,18 @@ def make_quadruped_entity_cfg(
         init_height: Initial root z. None scales REF_INIT_HEIGHT by leg length.
         stance_xml:  Extra model constraining the stance; see default_stance().
         geom_group:  Put every robot geom in this group. None keeps the XML's.
+        model:      Optional matching source model, read without modification.
+        stance_model: Optional compiled stance_xml for shared cohort preparation.
     """
     xml_path = _resolve_robot_xml(Path(xml_path))
+    if model is None:
+        model = mujoco.MjModel.from_xml_path(str(xml_path))
     if init_height is None:
-        leg_length = measure_quadruped_leg_length(xml_path)
+        lower = model.body("fl_lower_leg_link").id
+        foot = model.site("fl_foot").id
+        leg_length = float(np.linalg.norm(model.body_pos[lower])) + float(np.linalg.norm(model.site_pos[foot]))
         init_height = REF_INIT_HEIGHT * (leg_length / REF_LEG_LENGTH)
-    actuators = _actuator_cfgs_from_xml(xml_path)
+    actuators = _actuator_cfgs_from_xml(xml_path, model=model)
     captured = xml_path
 
     return EntityCfg(
@@ -291,7 +313,7 @@ def make_quadruped_entity_cfg(
         ),
         init_state=EntityCfg.InitialStateCfg(
             pos=(0.0, 0.0, init_height),
-            joint_pos=default_stance(xml_path, stance_xml),
+            joint_pos=default_stance(xml_path, stance_xml, model=model, stance_model=stance_model),
             joint_vel={".*": 0.0},
         ),
         collisions=(_TERRAIN_COLLISION,),

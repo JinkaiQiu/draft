@@ -8,9 +8,12 @@ import importlib
 
 _LAZY = {
     "make_env_cfg": ".env",
+    "make_env": ".codesign.native_env",
     "make_quadruped_entity_cfg": ".quadruped_entity",
     "QuadrupedLocomotionRunnerCfg": ".runner_cfg",
     "make_runner_cfg": ".runner_cfg",
+    "get_training_handler": ".dispatch",
+    "get_playback_handler": ".dispatch",
 }
 
 __all__ = list(_LAZY)

@@ -17,6 +17,7 @@ if "MUJOCO_GL" not in os.environ and sys.platform.startswith("linux"):
     os.environ["MUJOCO_GL"] = "egl"
 
 import argparse
+import json
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -69,6 +70,11 @@ def _parse_args() -> argparse.Namespace:
              "state (actor+critic+optimizer+obs-normalizer), so training continues "
              "without the warm-start normalizer dip. Use to top-up an existing run.",
     )
+    parser.add_argument("--video", action="store_true", help="Record native training rollouts headlessly.")
+    parser.add_argument("--video-length", type=int, default=500, help="Environment steps per video.")
+    parser.add_argument("--video-interval", type=int, default=2400, help="Environment steps between video starts.")
+    parser.add_argument("--video-width", type=int, default=640)
+    parser.add_argument("--video-height", type=int, default=480)
     return parser.parse_args()
 
 
@@ -87,6 +93,11 @@ def _apply_reward_overrides(env_cfg, overrides: dict) -> None:
 
 def main() -> None:
     args = _parse_args()
+    if args.video:
+        if args.video_length < 1 or args.video_interval < args.video_length:
+            raise SystemExit("Video length must be positive and no greater than its interval.")
+        if any(value < 2 or value % 2 for value in (args.video_width, args.video_height)):
+            raise SystemExit("Video dimensions must be positive even integers.")
 
     # ── Resolve task + config ────────────────────────────────────────────────
     if args.config is not None:
@@ -117,20 +128,6 @@ def main() -> None:
         raise SystemExit("Training needs a CUDA GPU and none was found. "
                          "It does not run on macOS or on a CPU.")
 
-    # ── Build env cfg ────────────────────────────────────────────────────────
-    env_cfg = task.make_env_cfg(
-        n_envs=runner_cfg.n_envs,
-        episode_length_s=runner_cfg.max_episode_length,
-        play=False,
-        **runner_cfg.env_kwargs,
-    )
-    _apply_reward_overrides(env_cfg, runner_cfg.reward_overrides)
-
-    # mjlab seeds only from the ENV cfg, once, in ManagerBasedRlEnv.__init__
-    # (rsl_rl does not seed). Set it before the env is built so python, numpy,
-    # warp and torch are seeded ahead of both scene and policy init.
-    env_cfg.seed = runner_cfg.seed
-
     # ── Log dir ──────────────────────────────────────────────────────────────
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_dir = Path(runner_cfg.log_dir) / runner_cfg.run_name / f"{timestamp}_{runner_cfg.run_name}"
@@ -147,7 +144,6 @@ def main() -> None:
 
     # ── Run metadata (for easy sweep aggregation) ─────────────────────────────
     # Sidecar describing the run; written first so it survives interruption.
-    import json
     import subprocess
     try:
         git_sha = subprocess.check_output(
@@ -167,17 +163,63 @@ def main() -> None:
         "seed": runner_cfg.seed,
         "timestamp": timestamp,
         "git_sha": git_sha,
+        "codesign": getattr(runner_cfg, "codesign", None),
+        "video": {"enabled": args.video, "length_steps": args.video_length,
+                  "interval_steps": args.video_interval, "width": args.video_width, "height": args.video_height},
     }
     with open(log_dir / "run_meta.json", "w") as f:
         json.dump(run_meta, f, indent=2)
 
+    # Some tasks own multiple successive robot cohorts rather than one fixed
+    # environment. The ordinary script still owns task/config/device/log setup.
+    training_handler = task.training_handler(runner_cfg)
+    if training_handler is not None:
+        training_handler(runner_cfg, log_dir=log_dir, resume=args.resume, metadata=run_meta)
+        return
+
+    # ── Build env cfg ────────────────────────────────────────────────────────
+    env_cfg = task.make_env_cfg(
+        n_envs=runner_cfg.n_envs,
+        episode_length_s=runner_cfg.max_episode_length,
+        play=False,
+        **runner_cfg.env_kwargs,
+    )
+    _apply_reward_overrides(env_cfg, runner_cfg.reward_overrides)
+
+    # Seed before construction so scene and policy initialization are seeded.
+    env_cfg.seed = runner_cfg.seed
+    if args.video:
+        env_cfg.viewer.width = args.video_width
+        env_cfg.viewer.height = args.video_height
+        env_cfg.viewer.env_idx = 0
+        env_cfg.viewer.max_extra_envs = 0
+
     # ── Build env + runner ───────────────────────────────────────────────────
-    env = task.env_class()(env_cfg, device=runner_cfg.device)
+    env = task.make_env(env_cfg, device=runner_cfg.device,
+                        render_mode="rgb_array" if args.video else None)
+    if args.video:
+        import shutil
+        import mediapy
+        from mjlab.utils.wrappers import VideoRecorder
+        if shutil.which("ffmpeg") is None:
+            try:
+                import imageio_ffmpeg
+            except ImportError as exc:
+                raise RuntimeError("--video requires ffmpeg on PATH or the imageio-ffmpeg package") from exc
+            mediapy.set_ffmpeg(imageio_ffmpeg.get_ffmpeg_exe())
+        env = VideoRecorder(env, video_folder=log_dir / "videos",
+                            step_trigger=lambda step: step % args.video_interval == 0,
+                            video_length=args.video_length)
     vec_env = RslRlVecEnvWrapper(env)
 
     train_cfg = runner_cfg.build_rsl_rl_cfg()
-    runner = MjlabOnPolicyRunner(
-        vec_env, train_cfg, log_dir=str(log_dir), device=runner_cfg.device)
+    from draft.tasks.native_runner import MetadataOnPolicyRunner, conditioning_transfer_metadata
+    checkpoint_metadata = conditioning_transfer_metadata(vec_env, train_cfg)
+    if checkpoint_metadata:
+        (log_dir / "conditioning.json").write_text(json.dumps(checkpoint_metadata, indent=2) + "\n")
+    runner = MetadataOnPolicyRunner(
+        vec_env, train_cfg, log_dir=str(log_dir), device=runner_cfg.device,
+        checkpoint_metadata=checkpoint_metadata)
 
     if args.resume:
         # Full-state resume (actor, critic, optimizer, obs normalizer).
@@ -192,10 +234,20 @@ def main() -> None:
             # runner.load restores the env step counter; a warm start enters a
             # new task whose curriculum must start from zero, else it opens
             # past the end of its ramp. (--resume keeps the counter.)
-            env.common_step_counter = 0
+            vec_env.unwrapped.common_step_counter = 0
+            import hashlib
+            source = Path(warmstart).resolve()
+            runner.checkpoint_metadata["warmstart"] = dict(
+                checkpoint=str(source), sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+                scope="actor, critic and normalization; fresh optimizer and training counters")
 
-    runner.learn(num_learning_iterations=runner_cfg.max_iterations)
-    env.close()
+    if checkpoint_metadata:
+        runner.save(str(log_dir / "model_initial.pt"), infos={"stage": "before learning"})
+
+    try:
+        runner.learn(num_learning_iterations=runner_cfg.max_iterations)
+    finally:
+        vec_env.close()
 
 
 if __name__ == "__main__":

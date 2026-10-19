@@ -91,6 +91,11 @@ def main() -> None:
     if args.viewer is not None:
         runner_cfg.viewer = args.viewer
 
+    playback_handler = task.playback_handler(runner_cfg)
+    if playback_handler is not None:
+        playback_handler(runner_cfg)
+        return
+
     # ── Resolve checkpoint ───────────────────────────────────────────────────
     if runner_cfg.checkpoint == "zeros":
         print("Zero-initializing policy weights.")
@@ -120,7 +125,7 @@ def main() -> None:
     device = runner_cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
     # ── Env + runner ─────────────────────────────────────────────────────────
-    env = ManagerBasedRlEnv(env_cfg, device=device)
+    env = task.make_env(env_cfg, device=device)
     vec_env = RslRlVecEnvWrapper(env)
 
     train_cfg = runner_cfg.build_rsl_rl_cfg()

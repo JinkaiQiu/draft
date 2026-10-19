@@ -80,7 +80,8 @@ def test_every_task_forwards_what_it_does_not_read(task, base_params):
 def test_a_task_only_names_parameters_the_base_has(task, base_params):
     """Every parameter a task names must exist on the base."""
     fn = _func(TASK_MODULES[task], "make_env_cfg")
-    extra = _named_params(fn) - base_params
+    augmentation = {"morphology_conditioning"} if task == "quadruped" else set()
+    extra = _named_params(fn) - base_params - augmentation
     assert not extra, (
         f"{task}: names {sorted(extra)}, which make_base_env_cfg does not have")
 

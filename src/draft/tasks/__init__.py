@@ -35,10 +35,29 @@ class TaskEntry:
     def make_runner_cfg(self):
         return self.load().make_runner_cfg()
 
+    def training_handler(self, runner_cfg=None):
+        """Optional task-owned learner for training lifecycles beyond one env."""
+        selector = getattr(self.load(), "get_training_handler", None)
+        if selector is None and getattr(runner_cfg, "codesign", None) is not None:
+            raise ValueError(f"Task {self.name!r} has not opted into morphology/co-design training")
+        return selector(runner_cfg) if selector is not None else getattr(self.load(), "train", None)
+
+    def playback_handler(self, runner_cfg=None):
+        """Optional checkpoint-aware construction for task-specific policies."""
+        selector = getattr(self.load(), "get_playback_handler", None)
+        if selector is None and getattr(runner_cfg, "codesign", None) is not None:
+            raise ValueError(f"Task {self.name!r} has not opted into morphology/co-design playback")
+        return selector(runner_cfg) if selector is not None else getattr(self.load(), "play", None)
+
     def env_class(self):
         """The task's ``ENV_CLASS`` if it defines one, else ``ManagerBasedRlEnv``."""
         from mjlab.envs import ManagerBasedRlEnv
         return getattr(self.load(), "ENV_CLASS", ManagerBasedRlEnv)
+
+    def make_env(self, cfg, **kwargs):
+        """Optional construction hook; training and playback share the same path."""
+        factory = getattr(self.load(), "make_env", None)
+        return factory(cfg, **kwargs) if factory is not None else self.env_class()(cfg, **kwargs)
 
     def default_config_yaml(self) -> Path:
         return self.path / "config.yaml"

@@ -6,7 +6,8 @@ variant shares one obs/action space and can warm-start from the base policy.
 
 The base trains on a fixed band of gentle generated terrain with a height scan
 and foot sensors, Froude-scaled rewards (by leg length), a modest interval push,
-and state-based fall terminations (only the feet collide).
+and state-based fall terminations. The default profile uses foot-only collisions;
+hardware-aware experiments opt into geometry-aware posture and body contacts.
 """
 
 from __future__ import annotations
@@ -193,6 +194,7 @@ def make_base_env_cfg(
     terrain_scale_with_size: bool = False,
     dimensional_weights: bool = False,
     terrain_scan_fix: str = "all",
+    hardware_aware: bool = False,
 ) -> tuple[ManagerBasedRlEnvCfg, BaseCtx]:
     """Shared gentle-terrain natural-gait env cfg + a context object.
 
@@ -203,7 +205,15 @@ def make_base_env_cfg(
     weights to cancel their cost's dimensions. ``terrain_scan_fix``: see
     :data:`TERRAIN_SCAN_FIXES`. Settings that change the task must match across
     any runs being compared.
+
+    ``hardware_aware`` opts into per-design stance heights, terrain-relative
+    posture criteria and primitive body-ground collisions. External commands,
+    terrain and episode duration continue to use the common task reference.
     """
+    if not isinstance(hardware_aware, bool):
+        raise ValueError("hardware_aware must be a boolean")
+    if hardware_aware and terrain_scan_fix == "none":
+        raise ValueError("hardware_aware requires terrain-only height scans; terrain_scan_fix cannot be 'none'")
     if terrain_scan_fix not in TERRAIN_SCAN_FIXES:
         raise ValueError(f"unknown terrain_scan_fix {terrain_scan_fix!r}; "
                          f"known: {TERRAIN_SCAN_FIXES}")
@@ -412,4 +422,7 @@ def make_base_env_cfg(
     else:
         cfg.episode_length_s = ctx.episode_length_s
 
+    if hardware_aware:
+        from .hardware import configure_hardware_task
+        configure_hardware_task(cfg, robot_xml, task_geometry_xml)
     return cfg, ctx
