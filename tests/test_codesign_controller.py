@@ -134,7 +134,8 @@ def test_shared_writer_receives_native_controller_metrics_without_a_new_writer()
     trainer = NativeControllerTrainer(policy(), config(), "cpu")
     trainer.train(Env(), 1, writer=writer)
     assert any(tag == "Controller/learning_rate" and step == 1 for tag, _, step in calls)
-    assert any(tag.startswith("Controller/Loss/") for tag, _, _ in calls)
+    assert {tag for tag, _, _ in calls if tag.startswith("Controller/Loss/")} == {
+        "Controller/Loss/value", "Controller/Loss/surrogate", "Controller/Loss/entropy"}
 
 
 @pytest.mark.parametrize("option", [dict(rnd_cfg={}), dict(symmetry_cfg={}), dict(multi_gpu_cfg={}),
@@ -218,14 +219,11 @@ def test_exact_completed_and_partial_episode_statistics_across_native_blocks():
     assert writer.scalars["Train/mean_reward", 1] == pytest.approx(68 / 7)
     assert writer.scalars["Train/mean_reward", 2] == pytest.approx(265 / 9)
     assert writer.scalars["Train/mean_episode_length", 2] == pytest.approx(97 / 9)
-    assert writer.scalars["Controller/PartialEpisode/count", 1] == 3
-    assert writer.scalars["Controller/PartialEpisode/count", 2] == 2
-    assert writer.scalars["Controller/PartialEpisode/mean_return", 2] == 73.5
     assert writer.scalars["Controller/PartialEpisode/mean_length", 2] == 25.5
-    assert writer.scalars["Controller/PartialEpisode/world_fraction", 2] == .5
+    assert {tag for tag, _ in writer.scalars if tag.startswith("Controller/PartialEpisode/")} == {
+        "Controller/PartialEpisode/mean_length"}
     assert metrics["controller_partial_episode_count"] == 2
-    assert writer.scalars["Metrics/step", 1] == 12.5
-    assert writer.scalars["Metrics/step", 2] == 36.5
+    assert not any(tag.startswith("Metrics/") for tag, _ in writer.scalars)
     assert ("Policy/mean_std", 2) in writer.scalars
 
 
@@ -247,11 +245,9 @@ def test_streaming_extras_weight_native_means_sum_termination_counts_and_copy_va
     reward.fill_(1000.)
     tracker.finish_block(writer, 1, transitions=9)
     assert writer.scalars["Episode_Reward/alive", 1] == 6.
-    assert writer.scalars["Episode_Metrics/height", 1] == 7.
     assert writer.scalars["Episode_Termination/fall", 1] == 2.
     assert writer.scalars["Episode_Termination/timeout", 1] == 1.
-    assert writer.scalars["Metrics/speed", 1] == 4.
-    assert writer.scalars["Episode/score", 1] == 8.
+    assert not any(tag.startswith(("Episode_Metrics/", "Metrics/", "Episode/")) for tag, _ in writer.scalars)
     assert not tracker.extras
 
 
@@ -279,7 +275,7 @@ def test_no_completions_are_partial_only_and_tracking_resets_for_new_cohort():
     assert "controller_mean_episode_reward" not in first
     assert not any(tag in ("Train/mean_reward", "Train/mean_episode_length") for tag, _ in writer.scalars)
     assert writer.scalars["Train/completed_episodes", 2] == 0
-    assert writer.scalars["Controller/PartialEpisode/mean_return", 2] == 48
+    assert writer.scalars["Controller/PartialEpisode/mean_length", 2] == 48
     assert first["controller_partial_episode_count"] == 4
     second = trainer.train(UnfinishedEnv(), 1, writer=writer, elapsed_env_steps=48)
     assert second["controller_partial_episode_mean_length"] == 24
@@ -311,3 +307,151 @@ def test_episode_logging_does_not_change_native_weights_optimizer_or_rng():
     for parameter, state in expected["state"].items():
         for key, value in state.items():
             torch.testing.assert_close(actual["state"][parameter][key], value, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("updates", [0, 1])
+def test_transition_callback_must_be_callable_before_environment_or_controller_mutation(updates):
+    trainer, env = NativeControllerTrainer(policy(), config(), "cpu"), Env()
+    with pytest.raises(TypeError, match="transition_callback"):
+        trainer.train(env, updates, elapsed_env_steps=100, transition_callback=3)
+    assert env.reset_at is None and env.common_step_counter == 0
+    assert trainer.alg is None and trainer.control.training and not trainer._training
+
+
+def test_transition_callback_observes_every_raw_step_before_ppo_and_retains_no_transitions(monkeypatch):
+    original = PPO.process_env_step
+    pending, observed, reward_refs = [], [], []
+
+    def observe(rewards, dones, extras):
+        assert torch.is_inference_mode_enabled()
+        torch.testing.assert_close(rewards, torch.tensor([1., 2., 3., 4.]), rtol=0, atol=0)
+        pending.append((id(rewards), id(dones), id(extras)))
+        observed.append((dones.clone(), extras["time_outs"].clone()))
+        reward_refs.append(weakref.ref(rewards))
+
+    def process(self, obs, rewards, dones, extras):
+        assert pending.pop() == (id(rewards), id(dones), id(extras))
+        torch.testing.assert_close(rewards, torch.tensor([1., 2., 3., 4.]), rtol=0, atol=0)
+        original(self, obs, rewards, dones, extras)
+        # A callback must consume values before PPO can modify its arguments.
+        rewards.add_(1000.)
+
+    monkeypatch.setattr(PPO, "process_env_step", process)
+    trainer = NativeControllerTrainer(policy(), config(), "cpu")
+    metrics = trainer.train(EpisodeEnv(), 2, transition_callback=observe)
+    assert len(observed) == 48 and not pending
+    for step, (done, timeout) in enumerate(observed, 1):
+        expected_done = torch.tensor([step % 5 == 0, step % 8 == 0, False, step % 48 == 0])
+        torch.testing.assert_close(done, expected_done)
+        torch.testing.assert_close(timeout, expected_done & torch.tensor([False, True, False, True]))
+    assert metrics["controller_mean_transition_reward"] == 2.5
+    assert all(reference() is None for reference in reward_refs)
+
+
+def test_read_only_transition_callback_preserves_native_training_metrics_and_rng():
+    control = policy()
+    initial = copy.deepcopy(control.state_dict())
+    with_callback = NativeControllerTrainer(control, config(), "cpu")
+    other_control = policy()
+    other_control.load_state_dict(initial)
+    without_callback = NativeControllerTrainer(other_control, config(), "cpu")
+    total_rewards = torch.zeros(4)
+
+    def observe(rewards, dones, extras):
+        total_rewards.add_(rewards)
+
+    torch.manual_seed(911)
+    expected = with_callback.train(EpisodeEnv(), 2, transition_callback=observe)
+    expected_rng = torch.get_rng_state().clone()
+    torch.manual_seed(911)
+    actual = without_callback.train(EpisodeEnv(), 2)
+    torch.testing.assert_close(total_rewards, torch.tensor([48., 96., 144., 192.]), rtol=0, atol=0)
+    torch.testing.assert_close(torch.get_rng_state(), expected_rng, rtol=0, atol=0)
+    for key, value in with_callback.control.state_dict().items():
+        torch.testing.assert_close(without_callback.control.state_dict()[key], value, rtol=0, atol=0)
+    expected_optimizer = with_callback.alg.optimizer.state_dict()
+    actual_optimizer = without_callback.alg.optimizer.state_dict()
+    assert expected_optimizer["param_groups"] == actual_optimizer["param_groups"]
+    for parameter, state in expected_optimizer["state"].items():
+        for key, value in state.items():
+            torch.testing.assert_close(actual_optimizer["state"][parameter][key], value, rtol=0, atol=0)
+    for key in expected:
+        if key not in ("controller_collect_seconds", "controller_update_seconds"):
+            assert actual[key] == expected[key]
+
+
+def test_preserved_environment_continues_observation_and_partial_episodes_across_calls():
+    class LongEpisodeEnv(Env):
+        def __init__(self):
+            super().__init__()
+            self.resets = 0
+
+        def reset(self):
+            self.resets += 1
+            return super().reset()
+
+        def step(self, actions):
+            observation, rewards, _, extras = super().step(actions)
+            return observation, torch.ones_like(rewards), torch.zeros_like(rewards, dtype=torch.bool), extras
+
+    cfg = config()
+    cfg["num_steps_per_env"] = 4
+    trainer, env = NativeControllerTrainer(policy(), cfg, "cpu"), LongEpisodeEnv()
+    first = trainer.train(env, 1, preserve_env_state=True)
+    second = trainer.train(env, 1, elapsed_env_steps=4, preserve_env_state=True)
+    assert env.resets == 1 and env.steps == 8
+    assert first["controller_partial_episode_mean_length"] == 4
+    assert second["controller_partial_episode_mean_length"] == 8
+    assert second["controller_partial_episode_mean_return"] == 8
+    assert second["controller_mean_transition_reward"] == 1
+    trainer.release_environment(env)
+    assert trainer._session_env is trainer._session_obs is trainer._session_episodes is None
+    third = trainer.train(env, 1, elapsed_env_steps=8, preserve_env_state=True)
+    assert env.resets == 2 and third["controller_partial_episode_mean_length"] == 4
+
+
+@pytest.mark.parametrize("design_count", [1, 2, 4])
+def test_staleness_probes_are_bounded_by_design_and_leave_training_rng_unchanged(design_count):
+    cfg = config()
+    cfg["num_steps_per_env"] = 4
+    cfg["staleness_diagnostics"] = True
+    cfg["staleness_probe_samples_per_design"] = 3
+    initial = policy().state_dict()
+    diagnosed, plain = NativeControllerTrainer(policy(), cfg, "cpu"), NativeControllerTrainer(policy(),
+                                                                                             dict(cfg, staleness_diagnostics=False), "cpu")
+    diagnosed.control.load_state_dict(initial)
+    plain.control.load_state_dict(initial)
+    writer = Writer()
+    torch.manual_seed(811)
+    metrics = diagnosed.train(Env(4), 2, writer=writer, design_count=design_count)
+    diagnosed_rng = torch.get_rng_state().clone()
+    torch.manual_seed(811)
+    plain.train(Env(4), 2, design_count=design_count)
+    torch.testing.assert_close(torch.get_rng_state(), diagnosed_rng, rtol=0, atol=0)
+    for key, value in diagnosed.control.state_dict().items():
+        torch.testing.assert_close(value, plain.control.state_dict()[key], rtol=0, atol=0)
+    for design in range(design_count):
+        prefix = f"controller_staleness_window_design_{design}_"
+        assert metrics[prefix + "probe_count"] == 3
+        assert 0 < metrics[prefix + "sampled_ess"] <= 3
+        assert 0 < metrics[prefix + "sampled_ess_fraction"] <= 1
+        assert metrics[prefix + "kl"] >= 0
+        assert 0 <= metrics[prefix + "clip_fraction"] <= 1
+        assert (f"Controller/Staleness/Window/Design_{design}/kl", 2) not in writer.scalars
+        assert metrics[f"controller_staleness_block_0_design_{design}_probe_count"] > 0
+        assert metrics[f"controller_staleness_block_1_design_{design}_probe_count"] > 0
+        assert metrics[f"controller_staleness_final_block_0_design_{design}_probe_count"] > 0
+        assert metrics[f"controller_staleness_final_block_1_design_{design}_probe_count"] > 0
+        assert metrics[prefix + "ratio_mean"] > 0
+        assert 0 <= metrics[prefix + "rho_clipped_fraction"] <= 1
+        assert (f"Controller/Staleness/FinalBlock_0/Design_{design}/mean_log_ratio", 2) not in writer.scalars
+    staleness_tags = {tag for tag, _ in writer.scalars if tag.startswith("Controller/Staleness/")}
+    assert staleness_tags == {f"Controller/Staleness/Window/{key}" for key in (
+        "kl", "clip_fraction", "sampled_ess_fraction", "early_late_kl_gap")}
+    assert writer.scalars["Controller/Staleness/Window/early_late_kl_gap", 2] == pytest.approx(
+        metrics["controller_staleness_final_block_0_kl"] - metrics["controller_staleness_final_block_1_kl"])
+    controller_tags = {tag for tag, _ in writer.scalars if tag.startswith("Controller/")}
+    assert len(controller_tags) <= 10
+    assert not any("Design_" in tag or "Block_" in tag for tag in controller_tags)
+    assert not any(tag in controller_tags for tag in (
+        "Controller/transitions", "Controller/collection_seconds", "Controller/update_seconds"))

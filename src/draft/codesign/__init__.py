@@ -14,6 +14,9 @@ def get_runner_class(config):
     if schedule == "alternating":
         from .alternating import AlternatingCodesignRunner
         return AlternatingCodesignRunner
+    if schedule == "coadaptation":
+        from .coadaptation import CoadaptationCodesignRunner
+        return CoadaptationCodesignRunner
     if schedule == "full_window":
         from .runner import CodesignRunner
         return CodesignRunner

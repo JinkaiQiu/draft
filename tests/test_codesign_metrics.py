@@ -40,7 +40,7 @@ def test_alternating_cards_are_compact_without_mutating_complete_raw_metrics():
     before = copy.deepcopy(metrics)
     scalars = tensorboard_scalars(metrics)
     assert metrics == before and len(metrics) == 71
-    assert len(scalars) == 43
+    assert len(scalars) == 41
     groups = Counter(tag.rsplit("/", 1)[0] for tag in scalars)
     assert groups["codesign"] == 2
     assert groups["HardwareMean"] == groups["HardwareStd"] == 7
@@ -93,3 +93,77 @@ def test_runner_routes_writer_only_and_preserves_raw_jsonl(tmp_path):
     assert {tag: value for tag, value, step in writes} == tensorboard_scalars(metrics)
     assert len(writes) == len({tag for tag, _, _ in writes})
     assert all(step == 1 for _, _, step in writes)
+
+
+@pytest.mark.parametrize("designs, blocks", [(2, 4), (32, 4), (64, 20)])
+def test_hardware_dashboard_card_count_is_independent_of_designs_and_blocks(designs, blocks):
+    metrics = {
+        "HardwareTraining/between_design_score_std": .09,
+        "HardwareTraining/naive_score_sem_mean": .08,
+        "HardwareTraining/first_last_block_ranking_disagreement": .4,
+        "HardwareTraining/replica_return_std_mean": 1.,
+        "HardwareTraining/replicas_per_design": 128,
+        "HardwareStaleness/before/kl": .002,
+        "HardwareStaleness/before/clip_fraction": .03,
+        "HardwareStaleness/before/sampled_ess_fraction": .99,
+        "HardwareStaleness/after/kl": .003,
+        "HardwareStaleness/after/clip_fraction": .04,
+        "HardwareStaleness/after/sampled_ess_fraction": .98,
+        "Controller/Cohort/interrupted_episodes": 4,
+        "cohort_age_steps": 256, "cohort_lifetime_steps": 1280,
+        "hardware_gamma": 1., "hardware_scoring_steps": 256,
+    }
+    for design in range(designs):
+        metrics[f"HardwareStaleness/before/Design_{design}/log_ratio"] = .01
+        metrics[f"HardwareTraining/Design_{design}/naive_score_sem"] = .08
+        metrics[f"Controller/Cohort/Design_{design}/age"] = 0
+        for block in range(blocks):
+            metrics[f"HardwareTraining/Block_{block}/Design_{design}/score"] = 4.
+        metrics[f"Controller/Staleness/Design_{design}/draw_index"] = design
+    # The controller's slot->draw map also belongs only in raw data.
+    before = copy.deepcopy(metrics)
+    scalars = tensorboard_scalars(metrics)
+    assert metrics == before
+    assert {k: v for k, v in scalars.items() if k.startswith("HardwareTraining/")} == {
+        "HardwareTraining/design_score_std": .09,
+        "HardwareTraining/estimated_score_error": .08,
+        "HardwareTraining/ranking_disagreement": .4,
+    }
+    assert {k: v for k, v in scalars.items() if k.startswith("HardwareStaleness/")} == {
+        "HardwareStaleness/kl": .002,
+        "HardwareStaleness/clip_fraction": .03,
+        "HardwareStaleness/ess_fraction": .99,
+    }
+    assert sum(k.startswith("Controller/Cohort/") for k in scalars) == 1
+    assert not any("Design_" in k or "Block_" in k for k in scalars)
+
+
+def test_native_coadaptation_writes_only_compact_event_tags_and_retains_raw_probes(tmp_path):
+    pytest.importorskip("torch")
+    pytest.importorskip("rsl_rl")
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    from test_codesign_persistent_cohort import make_runner
+
+    runner = make_runner([], logger="tensorboard", final_evaluation=False, final_export=False,
+                         eval_interval=0, staleness_diagnostics=True,
+                         staleness_probe_samples_per_design=8)
+    runner.log_dir = tmp_path
+    try:
+        runner.learn(1)
+    finally:
+        runner.close()
+    tags = EventAccumulator(str(tmp_path)).Reload().Tags()["scalars"]
+    assert {tag for tag in tags if tag.startswith("HardwareTraining/")} == {
+        "HardwareTraining/design_score_std", "HardwareTraining/estimated_score_error",
+        "HardwareTraining/ranking_disagreement",
+    }
+    assert {tag for tag in tags if tag.startswith("HardwareStaleness/")} == {
+        "HardwareStaleness/kl", "HardwareStaleness/clip_fraction", "HardwareStaleness/ess_fraction",
+    }
+    controller = {tag for tag in tags if tag.startswith("Controller/")}
+    assert len(controller) == 11  # Six training cards, four staleness cards, one interruption count.
+    assert not any("Design_" in tag or "Block_" in tag for tag in tags)
+    raw = json.loads((tmp_path / "metrics.jsonl").read_text())
+    assert "controller_staleness_final_block_0_design_0_kl" in raw
+    assert "HardwareTraining/Block_0/Design_0/score" in raw
+    assert "HardwareStaleness/after/Design_0/log_ratio" in raw

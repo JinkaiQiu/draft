@@ -37,18 +37,28 @@ def train(runner_cfg, *, log_dir: str | Path, resume: str | None = None,
     config.update(actor_cfg=native["actor"], critic_cfg=native["critic"],
                   obs_groups=native["obs_groups"], environment_family="quadruped_native",
                   normalization_exclusions={role: tuple(range(-7, 0)) for role in ("actor", "critic")})
-    alternating = runner_cfg.training_schedule == "alternating"
-    if alternating:
+    native_controller = runner_cfg.training_schedule in ("alternating", "coadaptation")
+    if native_controller:
         native["algorithm"]["schedule"] = runner_cfg.controller_schedule
+        if runner_cfg.training_schedule == "coadaptation":
+            native.update(staleness_diagnostics=runner_cfg.staleness_diagnostics,
+                          staleness_probe_samples_per_design=runner_cfg.staleness_probe_samples_per_design)
         config["controller_train_cfg"] = native
+    learners = {
+        "alternating": f"alternating native {runner_cfg.num_steps_per_env}-step controller PPO and frozen-controller hardware PPO",
+        "coadaptation": f"native {runner_cfg.num_steps_per_env}-step controller PPO and hardware PPO scored on shared training trajectories",
+        "full_window": "full-window joint PPO (custom control optimizer)",
+    }
+    if not runner_cfg.optimize_hardware:
+        learners[runner_cfg.training_schedule] = "native controller PPO with fixed hardware; hardware optimizer disabled"
     runner_type = get_runner_class(config)
-    build_env = native_codesign_factory(runner_cfg.env_kwargs["robot_xml"])
+    build_env = native_codesign_factory(runner_cfg.env_kwargs["robot_xml"],
+                                        horizon_steps=runner_cfg.horizon_steps)
     with DesignCompiler(space, runner_cfg.cache_dir, workers=runner_cfg.compiler_workers,
                         max_cache_entries=runner_cfg.max_cache_entries) as compiler:
         runner = runner_type(None, compiler, build_env, config, log_dir=log_dir,
                                 metadata={**(metadata or {}), "compiler_fingerprint": compiler.fingerprint,
-                                          "learner": ("alternating native 24-step controller PPO and frozen-controller hardware PPO"
-                                                      if alternating else "full-window joint PPO (custom control optimizer)"),
+                                          "learner": learners[runner_cfg.training_schedule],
                                           "environment": "original quadruped native cohort"})
         if resume or runner_cfg.warmstart_checkpoint:
             import gc

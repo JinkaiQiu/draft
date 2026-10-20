@@ -121,6 +121,39 @@ def test_controller_baseline_has_no_hardware_drift():
         torch.testing.assert_close(value, before[key], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("offset", [0, 1_000_003])
+def test_cohort_seed_offset_preserves_global_seed_and_advances_by_cycle(offset):
+    runner = make_runner(seed=7, training_seed_offset=offset, optimize_hardware=False)
+    seeds = []
+    def build(*args, **kwargs):
+        seeds.append(kwargs["seed"])
+        return Env(*args, **kwargs)
+    runner.env_factory = build
+    for _ in range(2):
+        runner.update(runner.collect())
+    assert runner.config["seed"] == 7
+    assert seeds == [7 + offset, 8 + offset]
+
+
+@pytest.mark.parametrize("offset", [-1, True, 1.5])
+def test_invalid_training_seed_offset_rejected(offset):
+    with pytest.raises(ValueError, match="training_seed_offset"):
+        make_runner(training_seed_offset=offset)
+
+
+def test_legacy_checkpoint_defaults_to_zero_training_seed_offset(tmp_path):
+    runner = make_runner()
+    runner.update(runner.collect())
+    path = tmp_path / "legacy.pt"
+    runner.save(path)
+    data = torch.load(path, weights_only=False)
+    del data["config"]["training_seed_offset"]
+    torch.save(data, path)
+    make_runner().load(path)
+    with pytest.raises(ValueError, match="training_seed_offset"):
+        make_runner(training_seed_offset=1_000_003).load(path)
+
+
 def test_checkpoint_roundtrip_rng_optimizer_schema_and_boundaries(tmp_path):
     runner = make_runner()
     batch = runner.collect()

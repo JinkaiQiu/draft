@@ -15,9 +15,19 @@ env_kwargs:
 
 # Fixed/randomized conditioning retain native PPO.
 # Optimize alternates native controller PPO with frozen full-trial hardware PPO.
+# Set training_schedule: coadaptation to score the same controller-training
+# trajectories instead. Do not set hardware_evaluation_steps/hardware_bootstrap
+# in that mode; eval_interval still runs independent frozen validation trials.
+# Co-adaptation keeps worlds across update windows for at least one full native
+# episode (rounded up to a complete window). 'window' restores per-window rebuilds.
+# Hardware gamma is independent of the controller PPO discount.
 codesign:
   mode: optimize
   training_schedule: alternating
+  coadaptation_cohort_lifetime: episode
+  hardware_gamma: 1.0
+  staleness_diagnostics: true
+  staleness_probe_samples_per_design: 64
   controller_updates_per_cycle: 20
   controller_schedule: adaptive
   num_designs: 16

@@ -14,6 +14,8 @@ from .runner import CodesignRunner, _observation
 class AlternatingCodesignRunner(CodesignRunner):
     """Train control on one cohort, then score fresh hardware draws without storage."""
 
+    TRAINING_SCHEDULE = "alternating"
+
     DEFAULTS = dict(CodesignRunner.DEFAULTS, training_schedule="alternating",
                     controller_updates_per_cycle=20, max_training_design_attempts=128,
                     controller_train_cfg=None, hardware_evaluation_steps=None, hardware_bootstrap=False)
@@ -28,8 +30,8 @@ class AlternatingCodesignRunner(CodesignRunner):
 
     def _validate_config(self):
         super()._validate_config()
-        if self.config["training_schedule"] != "alternating":
-            raise ValueError("Alternating runner requires training_schedule='alternating'")
+        if self.config["training_schedule"] != self.TRAINING_SCHEDULE:
+            raise ValueError(f"Runner requires training_schedule={self.TRAINING_SCHEDULE!r}")
         for name in ("controller_updates_per_cycle", "max_training_design_attempts"):
             value = self.config[name]
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -38,8 +40,9 @@ class AlternatingCodesignRunner(CodesignRunner):
             raise ValueError("max_training_design_attempts must be at least num_designs")
         if not isinstance(self.config["controller_train_cfg"], dict):
             raise ValueError("Alternating runner requires native controller_train_cfg")
-        if self.config["controller_train_cfg"].get("num_steps_per_env") != 24:
-            raise ValueError("Alternating controller PPO requires native 24-step rollouts")
+        steps = self.config["controller_train_cfg"].get("num_steps_per_env")
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+            raise ValueError("Native controller num_steps_per_env must be a positive integer")
         cap = self.config["hardware_evaluation_steps"]
         if cap is not None and (isinstance(cap, bool) or not isinstance(cap, int) or cap < 1):
             raise ValueError("hardware_evaluation_steps must be a positive integer or None")

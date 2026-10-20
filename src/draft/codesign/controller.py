@@ -78,9 +78,10 @@ class _EpisodeMetrics:
                 writer.add_scalar("Train/mean_reward", reward / count, iteration)
                 writer.add_scalar("Train/mean_episode_length", length / count, iteration)
             writer.add_scalar("Controller/mean_transition_reward", self.reward_sum.item() / transitions, iteration)
-            for key, value in partial.items():
-                writer.add_scalar("Controller/PartialEpisode/" + key, value, iteration)
+            writer.add_scalar("Controller/PartialEpisode/mean_length", partial["mean_length"], iteration)
             for tag, (amount, weight) in self.extras.items():
+                if not tag.startswith(("Episode_Reward/", "Episode_Termination/")):
+                    continue
                 denominator = weight.item() if weight is not None else 1.
                 if denominator:
                     writer.add_scalar(tag, amount.item() / denominator, iteration)
@@ -106,6 +107,39 @@ class _EpisodeMetrics:
                            controller_mean_episode_length=length / count)
         metrics.update({"controller_partial_episode_" + key: value for key, value in self.partial().items()})
         return metrics
+
+    def reset_totals(self):
+        """Begin a new reporting window without discarding active episodes."""
+        self.total_completed.zero_()
+        self.total_reward_sum.zero_()
+
+
+def _probe_statistics(actor, samples, clip_param):
+    """Compare sampled behavior actions with the current actor on their raw observations."""
+    observations = TensorDict({key: torch.cat([sample["obs"][key] for sample in samples])
+                               for key in samples[0]["obs"]}, batch_size=[len(samples)])
+    actions = torch.cat([sample["action"] for sample in samples])
+    old_log_prob = torch.cat([sample["log_prob"] for sample in samples])
+    old_params = tuple(torch.cat([sample["params"][i] for sample in samples])
+                       for i in range(len(samples[0]["params"])))
+    # Using the distribution module directly avoids sampling and leaves the RNG unchanged.
+    actor.distribution.update(actor.mlp(actor.get_latent(observations)))
+    new_params = actor.output_distribution_params
+    log_ratio = actor.get_output_log_prob(actions) - old_log_prob
+    kl = actor.get_kl_divergence(old_params, new_params)
+    # Normalize exponentials before computing sampled ESS to avoid overflow.
+    weights = torch.exp(log_ratio - log_ratio.max())
+    ess = weights.sum().square() / weights.square().sum()
+    lower = math.log1p(-clip_param) if clip_param < 1 else -math.inf
+    clipped = (log_ratio < lower) | (log_ratio > math.log1p(clip_param))
+    return dict(kl=float(kl.mean()), mean_log_ratio=float(log_ratio.mean()),
+                mean_abs_log_ratio=float(log_ratio.abs().mean()),
+                log_ratio_p95=float(torch.quantile(log_ratio.float(), .95)),
+                ratio_mean=float(torch.exp(log_ratio.double().clamp(max=700)).mean()),
+                clip_fraction=float(clipped.float().mean()),
+                rho_clipped_fraction=float((log_ratio > 0).float().mean()),
+                sampled_ess=float(ess), sampled_ess_fraction=float(ess / len(samples)),
+                probe_count=len(samples))
 
 
 class NativeControllerTrainer:
@@ -144,6 +178,26 @@ class NativeControllerTrainer:
         self._pending_optimizer = None
         self._learning_rate = self.algorithm_config.get("learning_rate", .001)
         self._training = False
+        self._session_env = None
+        self._session_obs = None
+        self._session_episodes = None
+        self.staleness_diagnostics = self.config.get("staleness_diagnostics", False)
+        if not isinstance(self.staleness_diagnostics, bool):
+            raise ValueError("staleness_diagnostics must be a boolean")
+        self.staleness_probe_samples_per_design = self.config.get("staleness_probe_samples_per_design", 16)
+        if (isinstance(self.staleness_probe_samples_per_design, bool)
+                or not isinstance(self.staleness_probe_samples_per_design, int)
+                or self.staleness_probe_samples_per_design < 1):
+            raise ValueError("staleness_probe_samples_per_design must be a positive integer")
+
+    def release_environment(self, env=None):
+        """Drop the retained observation and partial-episode state for a closed cohort."""
+        if self._training:
+            raise RuntimeError("Cannot release an environment during controller training")
+        if env is None or env is self._session_env:
+            self._session_env = None
+            self._session_obs = None
+            self._session_episodes = None
 
     @property
     def learning_rate(self):
@@ -198,11 +252,27 @@ class NativeControllerTrainer:
                 tensors.extend(item for item in value if isinstance(item, torch.Tensor))
         return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
 
-    def train(self, env, num_updates, writer=None, elapsed_env_steps=0):
+    def train(self, env, num_updates, writer=None, elapsed_env_steps=0, transition_callback=None,
+              preserve_env_state=False, design_count=None):
+        """Train native PPO, optionally observing every raw environment transition.
+
+        ``transition_callback(rewards, dones, extras)`` runs synchronously under
+        inference mode, before PPO timeout bootstrapping, for all replicas on
+        every step including auto-resets. Inputs are borrowed and read-only;
+        callbacks must not mutate them or retain transitions. Rewards and dones
+        are on the trainer device, and extras is the environment's mapping.
+        """
         if isinstance(num_updates, bool) or not isinstance(num_updates, int) or num_updates < 0:
             raise ValueError("num_updates must be a nonnegative integer")
         if isinstance(elapsed_env_steps, bool) or not isinstance(elapsed_env_steps, int) or elapsed_env_steps < 0:
             raise ValueError("elapsed_env_steps must be a nonnegative integer")
+        if transition_callback is not None and not callable(transition_callback):
+            raise TypeError("transition_callback must be callable or None")
+        if not isinstance(preserve_env_state, bool):
+            raise TypeError("preserve_env_state must be a boolean")
+        if design_count is not None and (isinstance(design_count, bool) or not isinstance(design_count, int)
+                                         or design_count < 1):
+            raise ValueError("design_count must be a positive integer")
         if self._training:
             raise RuntimeError("Controller training is already active")
         metrics = dict(controller_updates=0, controller_iterations=self.iteration, controller_transitions=0,
@@ -213,23 +283,48 @@ class NativeControllerTrainer:
         if not num_updates:
             self.control.eval()
             return metrics
+        if design_count is None:
+            design_count = 1
+        if env.num_envs % design_count:
+            raise ValueError("num_envs must be divisible by design_count")
+        if not preserve_env_state or env is not self._session_env:
+            self.release_environment()
         self._training = True
         storage = None
         losses = {}
-        episodes = _EpisodeMetrics(env.num_envs, self.device)
+        episodes = self._session_episodes if self._session_env is env else _EpisodeMetrics(env.num_envs, self.device)
+        completed = False
+        probes = []
+        probe_positions = (set(k * (num_updates * self.steps) //
+                               min(self.staleness_probe_samples_per_design, num_updates * self.steps)
+                               for k in range(min(self.staleness_probe_samples_per_design, num_updates * self.steps)))
+                           if self.staleness_diagnostics else set())
         try:
             native = env.unwrapped
             if hasattr(native, "common_step_counter"):
                 native.common_step_counter = elapsed_env_steps
-            obs = self._observations(env.reset(), env.num_envs)
+            obs = self._session_obs if self._session_env is env else self._observations(env.reset(), env.num_envs)
             storage = self._initialize(env, obs)
             self.control.train()
             self.alg.train_mode()
-            for _ in range(num_updates):
+            for block in range(num_updates):
                 started = self._time()
                 with torch.inference_mode():
-                    for _ in range(self.steps):
+                    for step in range(self.steps):
                         actions = self.alg.act(obs)
+                        position = block * self.steps + step
+                        if position in probe_positions:
+                            replicas = env.num_envs // design_count
+                            for design in range(design_count):
+                                world = design * replicas + position % replicas
+                                transition = self.alg.transition
+                                probes.append(dict(design=design, block=block,
+                                                   obs={key: value[world:world + 1].clone()
+                                                        for key, value in obs.items()},
+                                                   action=actions[world:world + 1].clone(),
+                                                   log_prob=transition.actions_log_prob[world:world + 1].clone(),
+                                                   params=tuple(p[world:world + 1].clone()
+                                                                for p in transition.distribution_params)))
                         next_obs, rewards, dones, extras = env.step(actions.to(env.device))
                         obs = self._observations(next_obs, env.num_envs)
                         rewards, dones = rewards.to(self.device), dones.to(self.device)
@@ -238,11 +333,27 @@ class NativeControllerTrainer:
                         # Account for raw environment rewards before native PPO
                         # adds timeout bootstrap values to its training targets.
                         episodes.step(rewards, dones, extras)
+                        if transition_callback is not None:
+                            transition_callback(rewards, dones, extras)
                         self.alg.process_env_step(obs, rewards, dones, extras)
                         self.control.preserve_conditioning_scale()
                     collected = self._time()
                     self.alg.compute_returns(obs)
                 report = self.alg.update()
+                if self.staleness_diagnostics:
+                    with torch.inference_mode():
+                        block_samples = [sample for sample in probes if sample["block"] == block]
+                        if block_samples:
+                            for key, value in _probe_statistics(self.control.actor, block_samples,
+                                                                 self.alg.clip_param).items():
+                                metrics[f"controller_staleness_block_{block}_{key}"] = value
+                        for design in range(design_count):
+                            chosen = [sample for sample in block_samples if sample["design"] == design]
+                            if chosen:
+                                prefix = f"controller_staleness_block_{block}_design_{design}_"
+                                for key, value in _probe_statistics(self.control.actor, chosen,
+                                                                     self.alg.clip_param).items():
+                                    metrics[prefix + key] = value
                 finished = self._time()
                 self.iteration += 1
                 transitions = env.num_envs * self.steps
@@ -255,22 +366,56 @@ class NativeControllerTrainer:
                 metrics["controller_storage_bytes_peak"] = max(metrics["controller_storage_bytes_peak"], self._storage_bytes(storage))
                 for key, value in report.items():
                     losses[key] = losses.get(key, 0.) + float(value)
-                    if writer is not None:
+                    if writer is not None and key in ("value", "surrogate", "entropy"):
                         writer.add_scalar("Controller/Loss/" + key, value, self.iteration)
                 if writer is not None:
                     writer.add_scalar("Controller/learning_rate", self.alg.learning_rate, self.iteration)
-                    writer.add_scalar("Controller/transitions", self.total_transitions, self.iteration)
-                    writer.add_scalar("Controller/collection_seconds", collected - started, self.iteration)
-                    writer.add_scalar("Controller/update_seconds", finished - collected, self.iteration)
                     writer.add_scalar("Policy/mean_std", self.control.actor.output_std.mean().item(), self.iteration)
             metrics.update(controller_iterations=self.iteration, total_controller_transitions=self.total_transitions,
                            elapsed_env_steps=elapsed_env_steps + num_updates * self.steps,
                            controller_learning_rate=self.alg.learning_rate)
             metrics.update(episodes.summary(metrics["controller_transitions"]))
             metrics.update({"controller_loss_" + key: value / num_updates for key, value in losses.items()})
+            if self.staleness_diagnostics and probes:
+                with torch.inference_mode():
+                    for key, value in _probe_statistics(self.control.actor, probes, self.alg.clip_param).items():
+                        metrics[f"controller_staleness_window_{key}"] = value
+                        if writer is not None and key in ("kl", "clip_fraction", "sampled_ess_fraction"):
+                            writer.add_scalar(f"Controller/Staleness/Window/{key}", value, self.iteration)
+                    for block in range(num_updates):
+                        block_samples = [sample for sample in probes if sample["block"] == block]
+                        if block_samples:
+                            for key, value in _probe_statistics(self.control.actor, block_samples,
+                                                                 self.alg.clip_param).items():
+                                metrics[f"controller_staleness_final_block_{block}_{key}"] = value
+                            for design in range(design_count):
+                                chosen = [sample for sample in block_samples if sample["design"] == design]
+                                if chosen:
+                                    prefix = f"controller_staleness_final_block_{block}_design_{design}_"
+                                    for key, value in _probe_statistics(self.control.actor, chosen,
+                                                                         self.alg.clip_param).items():
+                                        metrics[prefix + key] = value
+                    for design in range(design_count):
+                        chosen = [sample for sample in probes if sample["design"] == design]
+                        if chosen:
+                            prefix = f"controller_staleness_window_design_{design}_"
+                            for key, value in _probe_statistics(self.control.actor, chosen,
+                                                                 self.alg.clip_param).items():
+                                metrics[prefix + key] = value
+                    if num_updates > 1 and writer is not None:
+                        early_kl = metrics["controller_staleness_final_block_0_kl"]
+                        late_kl = metrics[f"controller_staleness_final_block_{num_updates - 1}_kl"]
+                        writer.add_scalar("Controller/Staleness/Window/early_late_kl_gap",
+                                          early_kl - late_kl, self.iteration)
             self._learning_rate = self.alg.learning_rate
+            if preserve_env_state:
+                self._session_env, self._session_obs, self._session_episodes = env, obs, episodes
+                episodes.reset_totals()
+            completed = True
             return metrics
         finally:
+            if not completed:
+                self._session_env = self._session_obs = self._session_episodes = None
             if self.alg is not None:
                 self.alg.optimizer.zero_grad(set_to_none=True)
                 self.alg.transition.clear()
@@ -294,6 +439,7 @@ class NativeControllerTrainer:
     def load_state_dict(self, state):
         if self._training:
             raise RuntimeError("Controller restore requires a completed native PPO block")
+        self.release_environment()
         if state.get("version") != self.VERSION or state["algorithm_config"] != self.algorithm_config or state["num_steps_per_env"] != self.steps:
             raise ValueError("Controller checkpoint changes native PPO configuration")
         if self.schema is not None and state["schema"] != self.schema:

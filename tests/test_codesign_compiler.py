@@ -55,6 +55,25 @@ def test_cache_pruning_retains_current_cohort(tmp_path):
         assert len(list(tmp_path.glob("*/design.json"))) == 1
 
 
+def test_retain_assets_survives_new_batch_and_releases_on_error(tmp_path):
+    space = DesignSpace.quadruped()
+    other = list(space.center)
+    other[0] *= 1.02
+    with DesignCompiler(space, tmp_path, max_cache_entries=1) as compiler:
+        live = compiler.compile(space.center)
+        with pytest.raises(RuntimeError, match="stop"):
+            with compiler.retain_assets([live.design_id]):
+                evaluation = compiler.compile(other)
+                assert live.xml_path.is_file()
+                assert evaluation.xml_path.is_file()
+                assert len(list(tmp_path.glob("*/design.json"))) == 2
+                raise RuntimeError("stop")
+        compiler.prune()
+        assert not live.xml_path.exists()
+        assert evaluation.xml_path.is_file()
+        assert len(list(tmp_path.glob("*/design.json"))) == 1
+
+
 def test_spawned_workers_produce_ordered_deduplicated_results(tmp_path):
     space = DesignSpace.quadruped()
     rows = np.asarray([space.center, space.center])

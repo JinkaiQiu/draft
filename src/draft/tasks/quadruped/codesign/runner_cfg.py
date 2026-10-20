@@ -15,8 +15,13 @@ class CodesignRunnerCfg(QuadrupedLocomotionRunnerCfg):
     num_designs: int = 16
     replicas: int = 32
     training_schedule: str = "full_window"
+    coadaptation_cohort_lifetime: str = "episode"
+    hardware_gamma: float = 1.0
+    staleness_diagnostics: bool = True
+    staleness_probe_samples_per_design: int = 64
     controller_updates_per_cycle: int = 20
     controller_schedule: str = "adaptive"
+    training_seed_offset: int = 0
     max_training_design_attempts: int = 128
     horizon_steps: int | None = None
     hardware_evaluation_steps: int | None = None
@@ -54,8 +59,19 @@ class CodesignRunnerCfg(QuadrupedLocomotionRunnerCfg):
     eval_video_height: int = 480
 
     def validate(self) -> None:
-        if self.training_schedule not in ("full_window", "alternating"):
-            raise ValueError("training_schedule must be full_window or alternating")
+        if isinstance(self.training_seed_offset, bool) or not isinstance(self.training_seed_offset, int) or self.training_seed_offset < 0:
+            raise ValueError("training_seed_offset must be a nonnegative integer")
+        if self.training_schedule not in ("full_window", "alternating", "coadaptation"):
+            raise ValueError("training_schedule must be full_window, alternating, or coadaptation")
+        if self.coadaptation_cohort_lifetime not in ("episode", "window"):
+            raise ValueError("coadaptation_cohort_lifetime must be 'episode' or 'window'")
+        if isinstance(self.hardware_gamma, bool) or not isinstance(self.hardware_gamma, (int, float)) or not math.isfinite(self.hardware_gamma) or not 0 <= self.hardware_gamma <= 1:
+            raise ValueError("hardware_gamma must be in [0, 1]")
+        if not isinstance(self.staleness_diagnostics, bool):
+            raise ValueError("staleness_diagnostics must be a boolean")
+        samples = self.staleness_probe_samples_per_design
+        if isinstance(samples, bool) or not isinstance(samples, int) or samples < 1:
+            raise ValueError("staleness_probe_samples_per_design must be a positive integer")
         if self.controller_schedule not in ("fixed", "adaptive"):
             raise ValueError("controller_schedule must be fixed or adaptive")
         steps = self.hardware_evaluation_steps
@@ -63,6 +79,9 @@ class CodesignRunnerCfg(QuadrupedLocomotionRunnerCfg):
             raise ValueError("hardware_evaluation_steps must be a positive integer or None")
         if not isinstance(self.hardware_bootstrap, bool):
             raise ValueError("hardware_bootstrap must be a boolean")
+        if self.training_schedule == "coadaptation" and (steps is not None or self.hardware_bootstrap):
+            raise ValueError("coadaptation scores the controller training window; "
+                             "remove hardware_evaluation_steps and hardware_bootstrap")
         if (steps is not None or self.hardware_bootstrap) and self.training_schedule != "alternating":
             raise ValueError("Hardware evaluation limits and bootstrapping require training_schedule='alternating'")
         if self.hardware_bootstrap and steps is None:
@@ -104,9 +123,11 @@ class CodesignRunnerCfg(QuadrupedLocomotionRunnerCfg):
             raise ValueError("co-design logger must be tensorboard, wandb, or none")
         if self.std_type != "scalar":
             raise ValueError("co-design currently supports scalar control standard deviations")
-        if self.num_steps_per_env != 24:
-            raise ValueError("Controller PPO uses 24-step rollouts; use hardware_evaluation_steps "
-                             "to limit alternating hardware evaluation")
+        if isinstance(self.num_steps_per_env, bool) or not isinstance(self.num_steps_per_env, int) or self.num_steps_per_env < 1:
+            raise ValueError("num_steps_per_env must be a positive integer")
+        if self.training_schedule == "full_window" and self.num_steps_per_env != 24:
+            raise ValueError("full_window requires num_steps_per_env=24; native alternating and "
+                             "coadaptation schedules support configurable controller rollout lengths")
 
 
 def make_runner_cfg() -> CodesignRunnerCfg:

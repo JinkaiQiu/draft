@@ -71,7 +71,7 @@ class CodesignRunner:
 
     CHECKPOINT_VERSION = 1
     DEFAULTS = dict(num_designs=8, replicas=8, horizon_steps=None, episode_length_s=20., device="cuda",
-                    seed=0, learning_rate=1e-3, gamma=.99, lam=.95, clip_param=.2,
+                    seed=0, training_seed_offset=0, learning_rate=1e-3, gamma=.99, lam=.95, clip_param=.2,
                     value_loss_coef=1., entropy_coef=.01, max_grad_norm=1., num_learning_epochs=5,
                     num_mini_batches=4, desired_kl=.01, hardware_target_kl=.02,
                     hardware_loss_weight=1., hardware_value_loss_coef=.5, hardware_entropy_coef=0.,
@@ -144,6 +144,9 @@ class CodesignRunner:
 
     def _validate_config(self):
         c = self.config
+        offset = c["training_seed_offset"]
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("training_seed_offset must be a nonnegative integer")
         cap = c.get("max_control_batch_size")
         if cap is not None and (isinstance(cap, bool) or not isinstance(cap, int) or cap < 1):
             raise ValueError("max_control_batch_size must be a positive integer or None")
@@ -215,10 +218,8 @@ class CodesignRunner:
             self.policy.eval()
         self.control_schema = schema
 
-    def collect(self):
-        if self.phase != "boundary":
-            raise RuntimeError("A cohort must be updated before collecting another")
-        self.phase = "collecting"
+    def _prepare_hardware_batch(self):
+        """Draw once and compile, retaining the unconditional sampling measure."""
         started = self._time()
         c = self.config
         self.policy.eval()
@@ -246,13 +247,24 @@ class CodesignRunner:
                                  for r in compiled],
                      valid_indices=valid_indices, control=None,
                      timings=dict(compile_seconds=compiled_at - started, build_seconds=0., rollout_seconds=0.))
+        return batch, [compiled[i].design for i in valid_indices]
+
+    def collect(self):
+        if self.phase != "boundary":
+            raise RuntimeError("A cohort must be updated before collecting another")
+        self.phase = "collecting"
+        started = self._time()
+        c = self.config
+        batch, designs = self._prepare_hardware_batch()
+        valid_indices = batch["valid_indices"]
         if valid_indices:
-            env = self.env_factory([compiled[i].design for i in valid_indices], c["replicas"],
+            build_started = self._time()
+            env = self.env_factory(designs, c["replicas"],
                                    device=str(self.device), episode_length_s=c["episode_length_s"],
-                                   seed=c["seed"] + self.iteration, env_kwargs=c["env_kwargs"],
+                                   seed=c["seed"] + c["training_seed_offset"] + self.iteration, env_kwargs=c["env_kwargs"],
                                    reward_overrides=c["reward_overrides"])
             built_at = self._time()
-            batch["timings"]["build_seconds"] = built_at - compiled_at
+            batch["timings"]["build_seconds"] = built_at - build_started
             try:
                 batch["control"] = self._collect_control(env, len(valid_indices))
                 batch["timings"]["rollout_seconds"] = self._time() - built_at
@@ -260,7 +272,7 @@ class CodesignRunner:
                 env.close()
                 del env
                 gc.collect()  # Native manager cycles otherwise retain the old GPU cohort.
-            scores[valid_indices] = self._design_scores(batch["control"], len(valid_indices)).to(self.device)
+            batch["scores"][valid_indices] = self._design_scores(batch["control"], len(valid_indices)).to(self.device)
         batch["timings"]["collect_seconds"] = self._time() - started
         self.phase = "collected"
         return batch
@@ -666,6 +678,8 @@ class CodesignRunner:
         mutable.add("eval_first_update")
         for key in set(self.config) | set(data["config"]):
             current, saved = self.config.get(key), data["config"].get(key)
+            if key == "training_seed_offset" and saved is None:
+                saved = 0  # Checkpoints predating optional cohort seed offsets.
             if key == "controller_train_cfg" and isinstance(current, dict) and isinstance(saved, dict):
                 # Native runner metadata may change when resuming into a new
                 # output directory; all model and PPO settings remain strict.

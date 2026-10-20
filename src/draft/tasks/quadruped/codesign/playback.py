@@ -49,7 +49,8 @@ def play_checkpoint(cfg) -> None:
     factory = build_env
     if config.get("environment_family") == "quadruped_native":
         from draft.tasks.quadruped.dispatch import native_codesign_factory
-        factory = native_codesign_factory(config["env_kwargs"]["robot_xml"])
+        factory = native_codesign_factory(config["env_kwargs"]["robot_xml"],
+                                          horizon_steps=config.get("horizon_steps"))
     with DesignCompiler(space, cfg.cache_dir, workers=cfg.compiler_workers,
                         max_cache_entries=cfg.max_cache_entries) as compiler:
         runner = get_runner_class(config)(None, compiler, factory, config)

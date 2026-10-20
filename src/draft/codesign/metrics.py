@@ -31,8 +31,7 @@ _TAGS = {
     "total_controller_transitions": "Progress/total_controller_transitions",
     "total_hardware_evaluation_transitions": "Progress/total_hardware_transitions",
     "elapsed_env_steps": "Progress/elapsed_env_steps",
-    "controller_training_draws": "Controller/Cohort/draws",
-    "controller_training_rejections": "Controller/Cohort/rejections",
+    "cohort_interrupted_episodes": "Controller/Cohort/interrupted_episodes",
 }
 
 # Constants and redundant summaries remain available in metrics.jsonl/config.
@@ -46,7 +45,37 @@ _OMIT = {
     "controller_completed_episode_count", "controller_mean_episode_reward", "controller_mean_episode_length",
     "controller_partial_episode_mean_return", "controller_partial_episode_mean_length",
     "controller_partial_episode_count", "controller_partial_episode_world_fraction",
+    "controller_training_draws", "controller_training_rejections",
+    "reused_training_transitions", "total_reused_training_transitions", "hardware_scoring_steps",
+    "hardware_score_accumulator_bytes", "hardware_true_terminations", "hardware_timeouts", "hardware_gamma",
+    "cohort_rebuilt", "cohorts_built", "cohort_age_steps", "cohort_lifetime_steps", "cohort_completed",
+    "cohort_initial_episode_completion_fraction", "cohort_interrupted_episode_mean_length",
+    "hardware_sample_age_updates", "resume_cohort_restarts",
 }
+
+# A fixed dashboard budget, independent of design count and PPO block count.
+# Hardware staleness is measured before this window's hardware optimizer update.
+# Detailed before/after, per-block and per-design values remain in metrics.jsonl.
+_SUMMARY_TAGS = {
+    "HardwareTraining/between_design_score_std": "HardwareTraining/design_score_std",
+    "HardwareTraining/naive_score_sem_mean": "HardwareTraining/estimated_score_error",
+    "HardwareTraining/first_last_block_ranking_disagreement": "HardwareTraining/ranking_disagreement",
+    "HardwareStaleness/before/kl": "HardwareStaleness/kl",
+    "HardwareStaleness/before/clip_fraction": "HardwareStaleness/clip_fraction",
+    "HardwareStaleness/before/sampled_ess_fraction": "HardwareStaleness/ess_fraction",
+    "Controller/Cohort/interrupted_episodes": "Controller/Cohort/interrupted_episodes",
+}
+for _name in ("kl", "clip_fraction", "sampled_ess_fraction", "early_late_kl_gap"):
+    _tag = "Controller/Staleness/Window/" + _name
+    _SUMMARY_TAGS[_tag] = _tag
+_SUMMARY_TAGS.update({tag: tag for tag in tuple(_SUMMARY_TAGS.values())})
+_COMPACT_GROUPS = ("HardwareTraining/", "HardwareStaleness/", "Controller/Cohort/", "Controller/Staleness/")
+
+
+def _summary_tag(tag):
+    if tag.startswith(_COMPACT_GROUPS):
+        return _SUMMARY_TAGS.get(tag)
+    return tag
 
 
 def tensorboard_scalars(metrics: Mapping[str, float]) -> dict[str, float]:
@@ -55,11 +84,17 @@ def tensorboard_scalars(metrics: Mapping[str, float]) -> dict[str, float]:
     Native controller blocks already emit their own losses and episode metrics.
     HardwareStd contains the Gaussian's latent standard deviations; HardwareMean
     contains decoded physical dimensions. Explicit namespaced tags take priority.
+    Hardware score quality and staleness each have three summary cards; cohort
+    bookkeeping and detailed probes are available only in raw metrics.
     """
     native_control = "controller_iterations" in metrics
-    result = {key: value for key, value in metrics.items() if "/" in key}
+    result = {tag: value for key, value in metrics.items() if "/" in key
+              and (tag := _summary_tag(key)) is not None}
     for key, value in metrics.items():
         if "/" in key or key in _OMIT or native_control and key.startswith("controller_loss_"):
+            continue
+        if key.startswith("controller_staleness_"):
+            # These probes are already written on the native controller-update axis.
             continue
         if key.startswith("hardware_mean_"):
             tag = "HardwareMean/" + key.removeprefix("hardware_mean_")
@@ -79,7 +114,9 @@ def tensorboard_scalars(metrics: Mapping[str, float]) -> dict[str, float]:
             tag = "Progress/" + key
         else:
             tag = _TAGS.get(key, "Diagnostics/" + key)
-        result.setdefault(tag, value)
+        tag = _summary_tag(tag)
+        if tag is not None:
+            result.setdefault(tag, value)
     records = metrics.get("hardware_records", 0)
     if records > 0 and "invalid_designs" in metrics:
         result.setdefault("codesign/valid_fraction", 1. - metrics["invalid_designs"] / records)

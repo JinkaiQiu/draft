@@ -16,6 +16,10 @@ def _native_conditioning(config):
         raise ValueError("codesign.mode must be fixed, randomized, or optimize")
     if mode == "optimize":
         return False
+    if mode == "fixed" and "training_schedule" in config.codesign:
+        if config.codesign["training_schedule"] != "coadaptation":
+            raise ValueError("Fixed cohort controller training requires training_schedule='coadaptation'")
+        return False
     # Keep the user-visible mapping intact for metadata and repeat selection.
     config.env_kwargs = {**config.env_kwargs, "morphology_conditioning": dict(config.codesign)}
     return True
@@ -29,8 +33,14 @@ def codesign_config(config):
     if not isinstance(options, dict):
         raise ValueError("codesign must be an optional mapping of hardware-optimization settings")
     options = dict(options)
-    if options.pop("mode", "optimize") != "optimize":
-        raise ValueError("Only codesign.mode=optimize selects the joint hardware optimizer")
+    mode = options.pop("mode", "optimize")
+    fixed_cohort = mode == "fixed" and options.get("training_schedule") == "coadaptation"
+    if mode != "optimize" and not fixed_cohort:
+        raise ValueError("Cohort training requires codesign.mode=optimize or fixed with training_schedule='coadaptation'")
+    if fixed_cohort:
+        if options.get("optimize_hardware", False) or options.get("hardware_sampling_mode", "fixed") != "fixed":
+            raise ValueError("Fixed cohort training requires optimize_hardware=False and hardware_sampling_mode='fixed'")
+        options.update(optimize_hardware=False, hardware_sampling_mode="fixed")
     valid = {field.name for field in dataclasses.fields(CodesignRunnerCfg)} - {"codesign"}
     unknown = set(options) - valid
     if unknown:
@@ -49,7 +59,7 @@ def codesign_config(config):
     values["normalization_exclusions"] = {"actor": tuple(range(-7, 0)), "critic": tuple(range(-7, 0))}
     resolved = CodesignRunnerCfg(**values)
     resolved.validate()
-    if not resolved.optimize_hardware:
+    if not resolved.optimize_hardware and not fixed_cohort:
         raise ValueError("codesign.mode=optimize selects hardware optimization; use codesign.mode=fixed or randomized for native controller training")
     if not resolved.env_kwargs.get("robot_xml"):
         raise ValueError("Quadruped codesign requires the same explicit env_kwargs.robot_xml task reference")
@@ -80,7 +90,7 @@ def play_codesign(config):
     return play(codesign_config(config))
 
 
-def native_codesign_factory(reference_xml):
+def native_codesign_factory(reference_xml, *, horizon_steps=None):
     """Use the original task/cohort environment with the joint optimizer."""
     from .codesign.env import CoDesignVecEnv
     from .codesign.native_env import build_native_env
@@ -91,7 +101,10 @@ def native_codesign_factory(reference_xml):
                    if key not in ("robot_xml", "task_geometry_xml", "morphology_conditioning")}
         native = build_native_env(designs, replicas, reference_xml=task_reference, device=device,
                                   episode_length_s=episode_length_s, seed=seed, env_kwargs=options,
-                                  reward_overrides=reward_overrides)
+                                  reward_overrides=reward_overrides, horizon_steps=horizon_steps)
         native.horizon_steps = native.max_episode_length
+        if horizon_steps is not None and native.horizon_steps != horizon_steps:
+            native.close()
+            raise ValueError("Configured horizon_steps differs from native fixed design duration")
         return CoDesignVecEnv(native)
     return build

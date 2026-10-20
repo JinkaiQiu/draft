@@ -8,6 +8,7 @@ are bound to each design while external demands keep their common reference.
 from __future__ import annotations
 
 import copy
+import math
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
@@ -119,12 +120,14 @@ def augment_native_cohort_cfg(cfg, designs: Sequence[Any], replicas: int,
 
 def make_native_env_cfg(designs: Sequence[Any], replicas: int,
                         reference_xml: str | Path, *, env_cfg_factory=None,
-                        cpu_compile_workers: int = 4, **base):
+                        cpu_compile_workers: int = 4, horizon_steps: int | None = None,
+                        **base):
     """Author the common original task, then apply the reusable cohort wrapper.
 
     An injectable task factory is an extension seam, not automatic registration
     for other tasks. Factories may return a config or ``(config, context)``.
-    ``episode_length_s`` retains the selected task's original episode semantics.
+    ``episode_length_s`` retains the selected task's original episode semantics
+    unless an explicit co-design ``horizon_steps`` overrides the native timeout.
     ``cpu_compile_workers=1`` selects serial independent CPU reference builds.
     """
     designs = tuple(designs)
@@ -142,6 +145,18 @@ def make_native_env_cfg(designs: Sequence[Any], replicas: int,
                      task_geometry_xml=task_reference,
                      n_envs=len(designs) * replicas, **base)
     cfg = result[0] if isinstance(result, tuple) else result
+    if horizon_steps is not None:
+        if isinstance(horizon_steps, bool) or not isinstance(horizon_steps, int) or horizon_steps < 1:
+            raise ValueError("horizon_steps must be a positive integer or None")
+        step_dt = cfg.sim.mujoco.timestep * cfg.decimation
+        duration = horizon_steps * step_dt
+        # Native timeouts use ceil(seconds / step_dt). Correct the rare
+        # round-up of the floating-point product without changing step_dt.
+        if math.ceil(duration / step_dt) > horizon_steps:
+            duration = math.nextafter(duration, -math.inf)
+        if math.ceil(duration / step_dt) != horizon_steps:
+            raise ValueError("horizon_steps cannot be represented at the native step_dt")
+        cfg.episode_length_s = duration
     cfg = augment_native_cohort_cfg(cfg, designs, replicas, task_reference)
     cfg.cpu_compile_workers = cpu_compile_workers
     return cfg
@@ -367,7 +382,8 @@ make_env = make_native_env
 
 
 def build_native_env(designs, replicas, *, reference_xml, device, episode_length_s=20.0,
-                     seed=0, env_kwargs=None, reward_overrides=None, render_mode=None):
+                     seed=0, env_kwargs=None, reward_overrides=None, render_mode=None,
+                     horizon_steps=None):
     """Convenience raw-env factory; generic train/play may use the two-stage API."""
     options = dict(env_kwargs or {})
     render_mode = options.pop("render_mode", render_mode)
@@ -378,7 +394,8 @@ def build_native_env(designs, replicas, *, reference_xml, device, episode_length
         if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 2 or value % 2):
             raise ValueError(f"render_{name} must be a positive even integer")
     cfg = make_native_env_cfg(designs, replicas, reference_xml,
-                              episode_length_s=episode_length_s, **options)
+                              episode_length_s=episode_length_s, horizon_steps=horizon_steps,
+                              **options)
     cfg.seed = seed
     for name, value in render_size.items():
         if value is not None:

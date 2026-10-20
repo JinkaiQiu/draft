@@ -1,5 +1,6 @@
 """Original-task cohort parity, shared terrain and independent native dynamics."""
 import copy
+import math
 import random
 from dataclasses import asdict
 from types import SimpleNamespace
@@ -70,6 +71,31 @@ def test_fixed_cohort_preserves_full_original_task(native_designs):
     fixed_robot = fixed.scene.entities["robot"].build().spec.compile()
     for field in ("body_pos", "body_mass", "body_inertia", "site_pos", "geom_size", "actuator_trnid"):
         np.testing.assert_array_equal(getattr(original_robot, field), getattr(fixed_robot, field))
+
+
+def test_native_cohort_explicit_step_horizon_sets_task_timeout(native_designs):
+    from mjlab.envs import mdp
+    from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
+
+    xml = native_designs[0].xml_path
+    original = make_native_env_cfg(native_designs[:1], 1, xml, episode_length_s=20.0)
+    scaled = make_native_env_cfg(native_designs[:1], 1, xml, episode_length_s=25.6)
+    extended = make_native_env_cfg(native_designs[:1], 1, xml,
+                                   episode_length_s=25.6, horizon_steps=1280)
+    step_dt = extended.sim.mujoco.timestep * extended.decimation
+    assert math.ceil(original.episode_length_s / step_dt) == 1045
+    assert math.ceil(scaled.episode_length_s / step_dt) > 1280
+    assert extended.episode_length_s == pytest.approx(25.6)
+    assert math.ceil(extended.episode_length_s / step_dt) == 1280
+    native_length = ManagerBasedRlEnv.max_episode_length.fget(SimpleNamespace(
+        max_episode_length_s=extended.episode_length_s, step_dt=step_dt))
+    assert native_length == 1280
+    torch.testing.assert_close(mdp.time_out(SimpleNamespace(
+        episode_length_buf=torch.tensor([1279, 1280]), max_episode_length=native_length)),
+        torch.tensor([False, True]))
+    for invalid in (True, 0, -1, 1.5):
+        with pytest.raises(ValueError, match="horizon_steps"):
+            make_native_env_cfg(native_designs[:1], 1, xml, horizon_steps=invalid)
 
 
 def test_hardware_aware_cohort_uses_per_design_posture_and_keeps_common_demands(native_designs):

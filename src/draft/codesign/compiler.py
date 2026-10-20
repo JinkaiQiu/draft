@@ -205,6 +205,23 @@ class DesignCompiler:
             raise ValueError(f"Rejected design {result.design_id}: {result.error}")
         return result.design
 
+    @contextmanager
+    def retain_assets(self, design_ids: Sequence[str]):
+        """Pin assets while another compile may replace this compiler's batch lease."""
+        ids = set(design_ids)
+        if not ids or any(not isinstance(design_id, str) or not design_id for design_id in ids):
+            raise ValueError("retain_assets requires nonempty design IDs")
+        lease = self._lease_dir / f"{os.getpid()}-{uuid4().hex}.json"
+        with _cache_lock(self.cache_dir):
+            temporary = lease.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"pid": os.getpid(), "designs": sorted(ids)}))
+            os.replace(temporary, lease)
+        try:
+            yield
+        finally:
+            with _cache_lock(self.cache_dir):
+                lease.unlink(missing_ok=True)
+
     def prune(self, protected: set[str] = frozenset()) -> None:
         with _cache_lock(self.cache_dir):
             entries = sorted((p for p in self.cache_dir.iterdir()

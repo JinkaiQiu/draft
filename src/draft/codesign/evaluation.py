@@ -39,6 +39,64 @@ def selected_design(runner):
     return result, normalized, physical
 
 
+def _tensor_digest(values):
+    digest = hashlib.sha256()
+    for name, value in values:
+        # mjlab TorchArray proxies delegate detach()/cpu() to the actual tensor.
+        if isinstance(value, torch.Tensor) or callable(getattr(value, "detach", None)):
+            value = value.detach().cpu().numpy()
+        value = np.ascontiguousarray(value)
+        digest.update(name.encode())
+        digest.update(str((value.shape, value.dtype)).encode())
+        digest.update(value.tobytes())
+    return digest.hexdigest()
+
+
+class PairingAudit:
+    """Keep terminated worlds outside RNG-consuming resets during paired trials.
+
+    mjlab normally requires a manual reset before the next step when auto-reset
+    is disabled. Here only first episodes are scored; terminated worlds continue
+    with zero actions and their observations/rewards are excluded. Clearing the
+    pending-reset guard permits this evaluation-only absorbing-trial adapter.
+    """
+
+    def __init__(self, env):
+        self.env = env.unwrapped
+        if not hasattr(self.env, "_manual_reset_pending"):
+            raise ValueError("Paired evaluation requires mjlab manual-reset support")
+        self.env.cfg.auto_reset = False
+        self.commands = hashlib.sha256()
+        self.rng = hashlib.sha256()
+        model = self.env.sim.model
+        terrain = self.env.scene.terrain
+        self.terrain = _tensor_digest([
+            (name, getattr(model, name)) for name in ("hfield_data", "hfield_size")
+            if hasattr(model, name)] + [
+            (name, getattr(terrain, name)) for name in ("env_origins", "terrain_levels", "terrain_types")
+            if hasattr(terrain, name)])
+
+    def record(self):
+        term = self.env.command_manager.get_term("twist")
+        # Body-frame heading/world transforms depend on robot motion. Audit the
+        # sampled latent targets and flags, which are the external demands.
+        names = ("time_left", "command_counter", "heading_target", "vel_command_w",
+                 "is_heading_env", "is_standing_env", "is_world_env", "is_forward_env")
+        self.commands.update(_tensor_digest([(name, getattr(term, name)) for name in names]).encode())
+        states = [("cpu", torch.get_rng_state())]
+        if torch.cuda.is_available():
+            states.extend((f"cuda_{i}", state) for i, state in enumerate(torch.cuda.get_rng_state_all()))
+        self.rng.update(_tensor_digest(states).encode())
+
+    def before_step(self):
+        self.env._manual_reset_pending.zero_()
+
+    def report(self):
+        return dict(terrain_sha256=self.terrain, command_latents_sha256=self.commands.hexdigest(),
+                    torch_rng_stream_sha256=self.rng.hexdigest(), auto_reset=False,
+                    posttermination="zero actions; continue simulation; exclude all later samples")
+
+
 def _tracking_errors(env):
     native = env.unwrapped
     if not hasattr(native, "scene") or not hasattr(native, "command_manager"):
@@ -79,7 +137,8 @@ def _video_options(runner, record_video):
 
 
 @torch.no_grad()
-def evaluate(runner, *, replicas=None, seed=None, record_video=None):
+def evaluate(runner, *, replicas=None, seed=None, record_video=None, physical=None,
+             include_trials=False, paired=False):
     from .runner import _observation
 
     if runner.phase != "boundary":
@@ -90,14 +149,27 @@ def evaluate(runner, *, replicas=None, seed=None, record_video=None):
     if isinstance(replicas, bool) or not isinstance(replicas, int) or replicas < 1:
         raise ValueError("Evaluation replicas must be a positive integer")
     video_options = _video_options(runner, record_video)
-    result, normalized, physical = selected_design(runner)
+    if paired and video_options is not None:
+        raise ValueError("Paired first-trial evaluation cannot record auto-reset video")
+    if physical is None:
+        result, normalized, physical = selected_design(runner)
+        selection = "decoded hardware mean"
+    else:
+        physical = np.asarray(physical, dtype=float)
+        normalized = runner.compiler.space.normalize(physical)
+        with preserved_rng():
+            result = runner.compiler.compile_many([physical])[0]
+        selection = "explicit physical geometry"
     report = dict(iteration=runner.iteration, seed=seed, replicas=replicas,
-                  selection="decoded hardware mean", role="development evaluation on held-out simulation seeds",
+                  selection=selection, role="development evaluation on held-out simulation seeds",
                   normalized=normalized.tolist(), physical=physical.tolist(), design_id=result.design_id,
                   valid=result.design is not None, error=result.error)
     if result.design is None:
         return dict(report, discounted_return_mean=c["invalid_design_return"], survival_fraction=0.)
     with preserved_rng():
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
         env_options = dict(c["env_kwargs"] or {})
         if video_options is not None:
             env_options.update(render_mode="rgb_array", render_width=video_options["width"],
@@ -108,6 +180,9 @@ def evaluate(runner, *, replicas=None, seed=None, record_video=None):
         recording = ExitStack()
         try:
             observation = _observation(env.reset())
+            audit = PairingAudit(env) if paired else None
+            if audit:
+                audit.record()
             runner._ensure_control(observation, env.num_actions)
             runner.policy.eval()
             active = torch.ones(replicas, dtype=torch.bool, device=runner.device)
@@ -117,6 +192,7 @@ def evaluate(runner, *, replicas=None, seed=None, record_video=None):
             durations = torch.zeros_like(returns)
             tracking = torch.zeros(2, device=runner.device)
             tracking_count = 0
+            trial_tracking = torch.zeros((2, replicas), device=runner.device)
             horizon = int(env.unwrapped.horizon_steps)
             writer = None
             if video_options is not None:
@@ -150,17 +226,30 @@ def evaluate(runner, *, replicas=None, seed=None, record_video=None):
                 errors = _tracking_errors(env)
                 if errors is not None:
                     tracking += torch.stack([error[active].sum() for error in errors])
+                    trial_tracking += torch.stack([torch.where(active, error, 0.) for error in errors])
                     tracking_count += int(active.sum())
-                actions = runner.policy.control.deterministic(observation)
+                observing = active
+                if writer is not None and step < video_steps:
+                    observing = active.clone()
+                    observing[0] = True
+                safe_observation = {key: torch.where(observing.reshape(-1, *([1] * (value.ndim - 1))),
+                                                      value, 0.) for key, value in observation.items()}
+                if any(not value.isfinite().all() for value in safe_observation.values()):
+                    raise ValueError("Nonfinite active deterministic evaluation observation")
+                actions = runner.policy.control.deterministic(safe_observation)
                 stepping_actions = torch.where(active[:, None], actions, torch.zeros_like(actions))
                 if writer is not None and step < video_steps:
                     stepping_actions[0] = actions[0]
+                if audit:
+                    audit.before_step()
                 observation, rewards, done, extras = env.step(stepping_actions)
+                if audit:
+                    audit.record()
                 observation = _observation(observation)
                 timeout = extras.get("time_outs", torch.zeros_like(done)).bool().reshape(-1)
                 terminated = extras.get("codesign_terminated", done.bool().reshape(-1) & ~timeout).bool().reshape(-1)
                 done = done.bool().reshape(-1) | terminated
-                rewards = (rewards.reshape(-1) + terminated * c["terminal_penalty"]) * active
+                rewards = torch.where(active, rewards.reshape(-1) + terminated * c["terminal_penalty"], 0.)
                 if not torch.isfinite(rewards).all():
                     raise ValueError("Nonfinite deterministic evaluation reward")
                 returns += rewards
@@ -173,6 +262,15 @@ def evaluate(runner, *, replicas=None, seed=None, record_video=None):
                           active_duration_fraction=(durations / horizon).mean().item(), horizon_steps=horizon,
                           velocity_tracking_rmse_m_s=(tracking[0] / tracking_count).sqrt().item() if tracking_count else None,
                           yaw_tracking_rmse_rad_s=(tracking[1] / tracking_count).sqrt().item() if tracking_count else None)
+            if audit:
+                report["pairing_audit"] = audit.report()
+            if include_trials:
+                report["trials"] = [dict(replica=i, **{"return": float(returns[i])},
+                    discounted_return=float(discounted[i]), survived=not bool(fell[i]),
+                    duration_steps=int(durations[i]),
+                    velocity_tracking_squared_error=float(trial_tracking[0, i]) if tracking_count else None,
+                    yaw_tracking_squared_error=float(trial_tracking[1, i]) if tracking_count else None)
+                    for i in range(replicas)]
         finally:
             try:
                 recording.close()
