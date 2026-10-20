@@ -32,6 +32,10 @@ _TAGS = {
     "total_hardware_evaluation_transitions": "Progress/total_hardware_transitions",
     "elapsed_env_steps": "Progress/elapsed_env_steps",
     "cohort_interrupted_episodes": "Controller/Cohort/interrupted_episodes",
+    "vtrace_design_score_mae_from_raw": "VTrace/score_correction",
+    "vtrace_action_ess_fraction": "VTrace/action_ess_fraction",
+    "vtrace_rho_clipped_fraction": "VTrace/clipped_fraction",
+    "vtrace_value_loss": "VTrace/value_loss",
 }
 
 # Constants and redundant summaries remain available in metrics.jsonl/config.
@@ -96,12 +100,16 @@ def tensorboard_scalars(metrics: Mapping[str, float]) -> dict[str, float]:
         if key.startswith("controller_staleness_"):
             # These probes are already written on the native controller-update axis.
             continue
+        if key.startswith("vtrace_") and key not in _TAGS and key != "vtrace_storage_bytes":
+            continue
         if key.startswith("hardware_mean_"):
             tag = "HardwareMean/" + key.removeprefix("hardware_mean_")
         elif key.startswith("hardware_latent_std_"):
             tag = "HardwareStd/latent_" + key.removeprefix("hardware_latent_std_")
         elif key == "controller_storage_bytes_peak":
             tag, value = "Memory/controller_rollout_mib", value / 2**20
+        elif key == "vtrace_storage_bytes":
+            tag, value = "Memory/vtrace_window_mib", value / 2**20
         elif key == "update_seconds":
             tag = "Perf/CoDesign/" + ("hardware_update_seconds" if native_control else "joint_update_seconds")
         elif key == "control_updates":

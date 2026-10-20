@@ -17,6 +17,8 @@ class CodesignRunnerCfg(QuadrupedLocomotionRunnerCfg):
     training_schedule: str = "full_window"
     coadaptation_cohort_lifetime: str = "episode"
     hardware_gamma: float = 1.0
+    hardware_vtrace: bool = False
+    hardware_vtrace_cfg: dict = field(default_factory=dict)
     staleness_diagnostics: bool = True
     staleness_probe_samples_per_design: int = 64
     controller_updates_per_cycle: int = 20
@@ -63,6 +65,12 @@ class CodesignRunnerCfg(QuadrupedLocomotionRunnerCfg):
             raise ValueError("training_seed_offset must be a nonnegative integer")
         if self.training_schedule not in ("full_window", "alternating", "coadaptation"):
             raise ValueError("training_schedule must be full_window, alternating, or coadaptation")
+        if not isinstance(self.hardware_vtrace, bool):
+            raise ValueError("hardware_vtrace must be a boolean")
+        if self.hardware_vtrace and self.training_schedule != "coadaptation":
+            raise ValueError("hardware_vtrace requires training_schedule='coadaptation'")
+        from draft.codesign.vtrace import HardwareVTraceScorer
+        HardwareVTraceScorer.validate_config(self.hardware_vtrace_cfg)
         if self.coadaptation_cohort_lifetime not in ("episode", "window"):
             raise ValueError("coadaptation_cohort_lifetime must be 'episode' or 'window'")
         if isinstance(self.hardware_gamma, bool) or not isinstance(self.hardware_gamma, (int, float)) or not math.isfinite(self.hardware_gamma) or not 0 <= self.hardware_gamma <= 1:

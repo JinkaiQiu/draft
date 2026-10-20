@@ -144,6 +144,11 @@ class CodesignRunner:
 
     def _validate_config(self):
         c = self.config
+        if "hardware_vtrace" in c:
+            if not isinstance(c["hardware_vtrace"], bool):
+                raise ValueError("hardware_vtrace must be a boolean")
+            if c["hardware_vtrace"] and c.get("training_schedule") != "coadaptation":
+                raise ValueError("hardware_vtrace requires training_schedule='coadaptation'")
         offset = c["training_seed_offset"]
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             raise ValueError("training_seed_offset must be a nonnegative integer")
@@ -680,6 +685,11 @@ class CodesignRunner:
             current, saved = self.config.get(key), data["config"].get(key)
             if key == "training_seed_offset" and saved is None:
                 saved = 0  # Checkpoints predating optional cohort seed offsets.
+            if key == "hardware_vtrace" and saved is None:
+                saved = False
+            if key == "hardware_vtrace_cfg" and saved is None:
+                from .vtrace import HardwareVTraceScorer
+                saved = HardwareVTraceScorer.validate_config() if current else {}
             if key == "controller_train_cfg" and isinstance(current, dict) and isinstance(saved, dict):
                 # Native runner metadata may change when resuming into a new
                 # output directory; all model and PPO settings remain strict.

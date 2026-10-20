@@ -380,6 +380,131 @@ def test_read_only_transition_callback_preserves_native_training_metrics_and_rng
             assert actual[key] == expected[key]
 
 
+@pytest.mark.parametrize("updates", [0, 1])
+@pytest.mark.parametrize("missing", ["before_step", "after_step"])
+def test_trajectory_observer_methods_validated_before_mutation(updates, missing):
+    class Observer:
+        def before_step(self, obs, actions, log_prob):
+            pass
+
+        def after_step(self, rewards, dones, extras):
+            pass
+
+    observer = Observer()
+    setattr(observer, missing, 3)
+    trainer, env = NativeControllerTrainer(policy(), config(), "cpu"), Env()
+    with pytest.raises(TypeError, match=f"trajectory_observer.{missing}"):
+        trainer.train(env, updates, elapsed_env_steps=100, trajectory_observer=observer)
+    assert env.reset_at is None and env.common_step_counter == 0
+    assert trainer.alg is None and trainer.control.training and not trainer._training
+
+
+def test_trajectory_observer_pairs_sampled_behavior_with_raw_outcomes(monkeypatch):
+    cfg = config()
+    cfg["num_steps_per_env"] = 4
+    trainer = NativeControllerTrainer(policy(), cfg, "cpu")
+    events, retained = [], []
+    original = PPO.process_env_step
+
+    class CheckedEnv(EpisodeEnv):
+        def step(self, actions):
+            assert events[-1] == "before"
+            events.append("env")
+            return super().step(actions)
+
+    class Observer:
+        def before_step(self, obs, actions, actual_behavior_log_prob):
+            assert torch.is_inference_mode_enabled()
+            assert obs is trainer.alg.transition.observations
+            assert actions is trainer.alg.transition.actions
+            assert actual_behavior_log_prob is trainer.alg.transition.actions_log_prob
+            assert trainer.control.actor.obs_normalizer.count.item() == len(retained) * 4
+            retained.append((obs["actor"].clone(), actions.clone(), actual_behavior_log_prob.clone()))
+            events.append("before")
+
+        def after_step(self, rewards, dones, extras):
+            assert events[-1] == "env"
+            torch.testing.assert_close(rewards, torch.tensor([1., 2., 3., 4.]), rtol=0, atol=0)
+            retained[-1] += (rewards.clone(), dones.clone(), extras["time_outs"].clone())
+            events.append("after")
+
+    def process(self, obs, rewards, dones, extras):
+        assert events[-1] == "after"
+        events.append("ppo")
+        original(self, obs, rewards, dones, extras)
+        rewards.add_(1000.)
+
+    monkeypatch.setattr(PPO, "process_env_step", process)
+    metrics = trainer.train(CheckedEnv(), 2, trajectory_observer=Observer())
+    assert events == [item for _ in range(8) for item in ("before", "env", "after", "ppo")]
+    assert len(retained) == 8
+    assert retained[0][0][0, 0] == 0
+    assert retained[1][0][0, 0] == pytest.approx(.2)
+    assert all(sample[3].tolist() == [1., 2., 3., 4.] for sample in retained)
+    assert metrics["controller_mean_transition_reward"] == 2.5
+
+
+def test_passive_trajectory_observer_preserves_native_training_metrics_weights_and_rng():
+    initial = copy.deepcopy(policy().state_dict())
+    observed = NativeControllerTrainer(policy(), config(), "cpu")
+    plain = NativeControllerTrainer(policy(), config(), "cpu")
+    observed.control.load_state_dict(initial)
+    plain.control.load_state_dict(initial)
+
+    class Observer:
+        def __init__(self):
+            self.before = self.after = 0
+
+        def before_step(self, obs, actions, actual_behavior_log_prob):
+            self.before += 1
+            assert actual_behavior_log_prob.shape == (4,)
+
+        def after_step(self, rewards, dones, extras):
+            self.after += 1
+
+    observer = Observer()
+    torch.manual_seed(911)
+    expected = observed.train(EpisodeEnv(), 2, trajectory_observer=observer)
+    expected_rng = torch.get_rng_state().clone()
+    torch.manual_seed(911)
+    actual = plain.train(EpisodeEnv(), 2)
+    assert (observer.before, observer.after) == (48, 48)
+    torch.testing.assert_close(torch.get_rng_state(), expected_rng, rtol=0, atol=0)
+    for key, value in observed.control.state_dict().items():
+        torch.testing.assert_close(plain.control.state_dict()[key], value, rtol=0, atol=0)
+    expected_optimizer, actual_optimizer = observed.alg.optimizer.state_dict(), plain.alg.optimizer.state_dict()
+    assert expected_optimizer["param_groups"] == actual_optimizer["param_groups"]
+    for parameter, state in expected_optimizer["state"].items():
+        for key, value in state.items():
+            torch.testing.assert_close(actual_optimizer["state"][parameter][key], value, rtol=0, atol=0)
+    for key in expected:
+        if key not in ("controller_collect_seconds", "controller_update_seconds"):
+            assert actual[key] == expected[key]
+
+
+@pytest.mark.parametrize("failure_method,expected_steps", [("before_step", 0), ("after_step", 1)])
+def test_trajectory_observer_exception_releases_rollout_state(failure_method, expected_steps):
+    class RaisingObserver:
+        def before_step(self, obs, actions, actual_behavior_log_prob):
+            if failure_method == "before_step":
+                raise RuntimeError("observer failure")
+
+        def after_step(self, rewards, dones, extras):
+            if failure_method == "after_step":
+                raise RuntimeError("observer failure")
+
+    cfg = config()
+    cfg["num_steps_per_env"] = 2
+    trainer, env = NativeControllerTrainer(policy(), cfg, "cpu"), Env()
+    with pytest.raises(RuntimeError, match="observer failure"):
+        trainer.train(env, 1, trajectory_observer=RaisingObserver(), preserve_env_state=True)
+    assert env.steps == expected_steps
+    assert not trainer._training and not trainer.control.training
+    assert trainer._session_env is trainer._session_obs is trainer._session_episodes is None
+    assert trainer.alg.storage is None
+    assert trainer.train(Env(), 1)["controller_updates"] == 1
+
+
 def test_preserved_environment_continues_observation_and_partial_episodes_across_calls():
     class LongEpisodeEnv(Env):
         def __init__(self):

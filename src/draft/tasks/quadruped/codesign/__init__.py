@@ -49,6 +49,8 @@ def train(runner_cfg, *, log_dir: str | Path, resume: str | None = None,
         "coadaptation": f"native {runner_cfg.num_steps_per_env}-step controller PPO and hardware PPO scored on shared training trajectories",
         "full_window": "full-window joint PPO (custom control optimizer)",
     }
+    if runner_cfg.training_schedule == "coadaptation" and runner_cfg.hardware_vtrace:
+        learners["coadaptation"] += "; latest-controller V-trace hardware scoring"
     if not runner_cfg.optimize_hardware:
         learners[runner_cfg.training_schedule] = "native controller PPO with fixed hardware; hardware optimizer disabled"
     runner_type = get_runner_class(config)

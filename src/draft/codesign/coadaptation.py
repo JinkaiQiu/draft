@@ -85,16 +85,23 @@ class CoadaptationCodesignRunner(AlternatingCodesignRunner):
     TRAINING_SCHEDULE = "coadaptation"
     DEFAULTS = dict(AlternatingCodesignRunner.DEFAULTS, training_schedule="coadaptation",
                     coadaptation_cohort_lifetime="episode", hardware_gamma=1.,
-                    staleness_diagnostics=True, staleness_probe_samples_per_design=64)
+                    staleness_diagnostics=True, staleness_probe_samples_per_design=64,
+                    hardware_vtrace=False, hardware_vtrace_cfg={})
 
     def __init__(self, *args, **kwargs):
         self.reused_training_transitions = 0
         self._cohort = None
+        self._vtrace_scorer = None
         self.cohorts_built = self.resume_cohort_restarts = 0
         super().__init__(*args, **kwargs)
 
     def _validate_config(self):
         super()._validate_config()
+        from .vtrace import HardwareVTraceScorer
+        c = self.config
+        if not isinstance(c["hardware_vtrace"], bool):
+            raise ValueError("hardware_vtrace must be a boolean")
+        c["hardware_vtrace_cfg"] = HardwareVTraceScorer.validate_config(c["hardware_vtrace_cfg"])
         if self.config["hardware_evaluation_steps"] is not None:
             raise ValueError("Co-adaptation does not use hardware_evaluation_steps")
         if self.config["hardware_bootstrap"]:
@@ -112,6 +119,13 @@ class CoadaptationCodesignRunner(AlternatingCodesignRunner):
         self.config["controller_train_cfg"] = dict(self.config["controller_train_cfg"],
             staleness_diagnostics=self.config["staleness_diagnostics"],
             staleness_probe_samples_per_design=samples)
+
+    def _ensure_vtrace_scorer(self):
+        if self._vtrace_scorer is None:
+            from .vtrace import HardwareVTraceScorer
+            self._vtrace_scorer = HardwareVTraceScorer(self.policy.control,
+                self.config["hardware_vtrace_cfg"], device=self.device, seed=self.config["seed"] + 73_856_093)
+        return self._vtrace_scorer
 
     def collect(self):
         if self.config["coadaptation_cohort_lifetime"] == "episode":
@@ -257,6 +271,12 @@ class CoadaptationCodesignRunner(AlternatingCodesignRunner):
                 cohort["lengths"].add_(1).masked_fill_(done, 0)
         options = (dict(preserve_env_state=True, design_count=num_designs)
                    if self._cohort is not None else dict(design_count=num_designs))
+        trajectory = None
+        if c["hardware_vtrace"]:
+            from .vtrace import WindowTrajectoryRecorder
+            expected_steps = c["controller_updates_per_cycle"] * c["controller_train_cfg"]["num_steps_per_env"]
+            trajectory = WindowTrajectoryRecorder(count, expected_steps, terminal_penalty=c["terminal_penalty"])
+            options["trajectory_observer"] = trajectory
         training = self._ensure_controller_trainer().train(
             env, c["controller_updates_per_cycle"], writer=self.writer,
             elapsed_env_steps=self.elapsed_env_steps, transition_callback=observe, **options)
@@ -268,6 +288,14 @@ class CoadaptationCodesignRunner(AlternatingCodesignRunner):
             for slot, index in enumerate(valid_indices):
                 training[f"Controller/Staleness/Design_{slot}/draw_index"] = index
         replica_returns = score.returns.reshape(num_designs, c["replicas"])
+        raw_replica_returns = replica_returns
+        if trajectory is not None:
+            corrected, correction_metrics = self._ensure_vtrace_scorer().score(trajectory, gamma=c["hardware_gamma"])
+            replica_returns = corrected.reshape(num_designs, c["replicas"])
+            training.update(correction_metrics)
+            training["vtrace_design_score_mae_from_raw"] = (
+                replica_returns.mean(-1) - raw_replica_returns.mean(-1)).abs().mean().item()
+            training["vtrace_target_controller_iteration"] = training["controller_iterations"]
         training["HardwareTraining/replicas_per_design"] = c["replicas"]
         training["HardwareTraining/between_design_score_std"] = (
             replica_returns.mean(-1).std(unbiased=True).item() if num_designs > 1 else 0.)
@@ -354,6 +382,7 @@ class CoadaptationCodesignRunner(AlternatingCodesignRunner):
         self._close_cohort()
         super()._fresh_warmstart_state(*args)
         self.reused_training_transitions = 0
+        self._vtrace_scorer = None
         self.cohorts_built = self.resume_cohort_restarts = 0
 
     def _extra_checkpoint_state(self):
@@ -362,6 +391,7 @@ class CoadaptationCodesignRunner(AlternatingCodesignRunner):
             cohorts_built=self.cohorts_built, resume_cohort_restarts=self.resume_cohort_restarts,
             resume_discards_live_cohort=self._cohort is not None,
             live_cohort_age_steps=self._cohort["age"] if self._cohort else 0,
+            vtrace_scorer=self._vtrace_scorer.state_dict() if self._vtrace_scorer else None,
             resume_scope="Controller/hardware optimizer boundary; resume builds a fresh cohort, not simulator continuation")
         return state
 
@@ -379,3 +409,8 @@ class CoadaptationCodesignRunner(AlternatingCodesignRunner):
         self.reused_training_transitions = total
         self.cohorts_built = state.get("cohorts_built", 0)
         self.resume_cohort_restarts = state.get("resume_cohort_restarts", 0) + int(state.get("resume_discards_live_cohort", False))
+        self._vtrace_scorer = None
+        if state.get("vtrace_scorer") is not None:
+            if not self.config["hardware_vtrace"]:
+                raise ValueError("V-trace critic requires hardware_vtrace=True")
+            self._ensure_vtrace_scorer().load_state_dict(state["vtrace_scorer"])

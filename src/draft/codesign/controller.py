@@ -253,7 +253,7 @@ class NativeControllerTrainer:
         return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
 
     def train(self, env, num_updates, writer=None, elapsed_env_steps=0, transition_callback=None,
-              preserve_env_state=False, design_count=None):
+              preserve_env_state=False, design_count=None, trajectory_observer=None):
         """Train native PPO, optionally observing every raw environment transition.
 
         ``transition_callback(rewards, dones, extras)`` runs synchronously under
@@ -261,6 +261,12 @@ class NativeControllerTrainer:
         every step including auto-resets. Inputs are borrowed and read-only;
         callbacks must not mutate them or retain transitions. Rewards and dones
         are on the trainer device, and extras is the environment's mapping.
+
+        ``trajectory_observer`` receives ``before_step(obs, actions,
+        actual_behavior_log_prob)`` immediately after action sampling and
+        ``after_step(rewards, dones, extras)`` after the environment step,
+        before the existing transition callback and PPO processing. All values
+        are borrowed and read-only; an observer retaining values must clone them.
         """
         if isinstance(num_updates, bool) or not isinstance(num_updates, int) or num_updates < 0:
             raise ValueError("num_updates must be a nonnegative integer")
@@ -268,6 +274,10 @@ class NativeControllerTrainer:
             raise ValueError("elapsed_env_steps must be a nonnegative integer")
         if transition_callback is not None and not callable(transition_callback):
             raise TypeError("transition_callback must be callable or None")
+        if trajectory_observer is not None:
+            for method in ("before_step", "after_step"):
+                if not callable(getattr(trajectory_observer, method, None)):
+                    raise TypeError(f"trajectory_observer.{method} must be callable")
         if not isinstance(preserve_env_state, bool):
             raise TypeError("preserve_env_state must be a boolean")
         if design_count is not None and (isinstance(design_count, bool) or not isinstance(design_count, int)
@@ -312,6 +322,8 @@ class NativeControllerTrainer:
                 with torch.inference_mode():
                     for step in range(self.steps):
                         actions = self.alg.act(obs)
+                        if trajectory_observer is not None:
+                            trajectory_observer.before_step(obs, actions, self.alg.transition.actions_log_prob)
                         position = block * self.steps + step
                         if position in probe_positions:
                             replicas = env.num_envs // design_count
@@ -330,6 +342,8 @@ class NativeControllerTrainer:
                         rewards, dones = rewards.to(self.device), dones.to(self.device)
                         if self.config.get("check_for_nan", True):
                             check_nan(obs, rewards, dones)
+                        if trajectory_observer is not None:
+                            trajectory_observer.after_step(rewards, dones, extras)
                         # Account for raw environment rewards before native PPO
                         # adds timeout bootstrap values to its training targets.
                         episodes.step(rewards, dones, extras)

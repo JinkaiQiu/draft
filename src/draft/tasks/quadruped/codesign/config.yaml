@@ -26,6 +26,10 @@ codesign:
   training_schedule: alternating
   coadaptation_cohort_lifetime: episode
   hardware_gamma: 1.0
+  # Optional latest-controller correction of hardware scores in coadaptation.
+  # Retains one trajectory window on CPU; owns a separate finite-window critic.
+  hardware_vtrace: false
+  hardware_vtrace_cfg: {}
   staleness_diagnostics: true
   staleness_probe_samples_per_design: 64
   controller_updates_per_cycle: 20

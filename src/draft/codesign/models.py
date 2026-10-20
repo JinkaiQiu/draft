@@ -40,17 +40,28 @@ class ConditionedMLPModel(MLPModel):
                 setattr(normalizer, name, torch.cat((previous, extra), dim=-1))
         self.conditioning_dims = conditioning_dims
         self.preserve_conditioning_scale()
+        self.register_load_state_dict_pre_hook(self._prepare_normalizer_restore)
         self.register_load_state_dict_post_hook(self._restore_conditioning_scale)
 
     @torch.no_grad()
     def preserve_conditioning_scale(self):
         if self.obs_normalization:
             normalizer = self.obs_normalizer
+            if not torch.is_inference_mode_enabled():
+                # Native collection may replace _std with an inference tensor.
+                # Checkpoint loading also invokes this hook outside collection.
+                for field in ("_mean", "_var", "_std"):
+                    value = getattr(normalizer, field)
+                    if torch.is_inference(value):
+                        setattr(normalizer, field, value.clone())
             normalizer._mean[:, -self.conditioning_dims:] = 0.
             normalizer._std[:, -self.conditioning_dims:] = 1. - normalizer.eps
             normalizer._var[:, -self.conditioning_dims:] = (1. - normalizer.eps) ** 2
 
     def _restore_conditioning_scale(self, module, incompatible_keys):
+        self.preserve_conditioning_scale()
+
+    def _prepare_normalizer_restore(self, module, *args):
         self.preserve_conditioning_scale()
 
     def update_normalization(self, obs):
