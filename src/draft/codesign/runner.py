@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import copy
 import hashlib
 from importlib.metadata import PackageNotFoundError, version
 import gc
@@ -25,6 +26,51 @@ def _observation(value):
     if isinstance(value, tuple):
         value = value[0]
     return {key: tensor.detach().clone() for key, tensor in value.items()}
+
+
+def _warmstart_bound_transform(source, target):
+    """Return the affine old-normalized coordinates of new-normalized inputs."""
+    if source == target:
+        return None
+    if not isinstance(source, dict) or not isinstance(target, dict):
+        raise ValueError("Warm start requires an explicit design-space schema")
+    old, new = copy.deepcopy(source), copy.deepcopy(target)
+    if "parameters" in old and "parameters" in new:
+        old_bounds = [(p.pop("lower"), p.pop("upper")) for p in old["parameters"]]
+        new_bounds = [(p.pop("lower"), p.pop("upper")) for p in new["parameters"]]
+    elif all(key in old and key in new for key in ("names", "lower", "upper", "center")):
+        old_bounds = list(zip(old.pop("lower"), old.pop("upper")))
+        new_bounds = list(zip(new.pop("lower"), new.pop("upper")))
+    else:
+        raise ValueError("Warm start requires an explicit design-space schema")
+    if old != new or len(old_bounds) != len(new_bounds) or not old_bounds:
+        raise ValueError("Warm start may change bounds only; reference, coordinate names and initial geometry must match")
+    old_bounds = np.asarray(old_bounds, dtype=np.float64)
+    new_bounds = np.asarray(new_bounds, dtype=np.float64)
+    if (old_bounds.shape != new_bounds.shape or not np.isfinite(old_bounds).all()
+            or not np.isfinite(new_bounds).all() or np.any(old_bounds[:, 1] <= old_bounds[:, 0])
+            or np.any(new_bounds[:, 1] <= new_bounds[:, 0])):
+        raise ValueError("Warm start design bounds must be finite ordered pairs")
+    old_width = old_bounds[:, 1] - old_bounds[:, 0]
+    return ((new_bounds[:, 1] - new_bounds[:, 0]) / old_width,
+            (new_bounds.sum(axis=1) - old_bounds.sum(axis=1)) / old_width)
+
+
+def _remap_conditioned_weights(state, prefix, indices, transform):
+    """Copy a state dict and retain the first-layer function of physical geometry."""
+    scale, offset = transform
+    weight_key, bias_key = prefix + "mlp.0.weight", prefix + "mlp.0.bias"
+    weight, bias = state.get(weight_key), state.get(bias_key)
+    if (weight is None or bias is None or weight.ndim != 2 or bias.ndim != 1
+            or len(indices) != len(scale) or list(indices) != list(range(weight.shape[1] - len(scale), weight.shape[1]))):
+        raise ValueError("Changed bounds require trailing ConditionedMLPModel morphology inputs")
+    result = dict(state)
+    scale = torch.as_tensor(scale, dtype=weight.dtype, device=weight.device)
+    offset = torch.as_tensor(offset, dtype=weight.dtype, device=weight.device)
+    result[weight_key] = weight.clone()
+    result[bias_key] = bias.clone() + weight[:, indices] @ offset
+    result[weight_key][:, indices] = weight[:, indices] * scale
+    return result
 
 
 def finite_horizon_advantages(rewards, values, active, gamma, lam):
@@ -75,6 +121,7 @@ class CodesignRunner:
                     value_loss_coef=1., entropy_coef=.01, max_grad_norm=1., num_learning_epochs=5,
                     num_mini_batches=4, desired_kl=.01, hardware_target_kl=.02,
                     hardware_loss_weight=1., hardware_value_loss_coef=.5, hardware_entropy_coef=0.,
+                    hardware_mass_cost_weight=0., hardware_mass_reference_kg=None,
                     terminal_penalty=-10., invalid_design_return=-1000., hardware_std=.5,
                     optimize_hardware=True, hardware_sampling_mode="stochastic", logger="tensorboard", wandb_project="draft_codesign",
                     use_clipped_value_loss=True, schedule="fixed",
@@ -144,6 +191,10 @@ class CodesignRunner:
 
     def _validate_config(self):
         c = self.config
+        from .mass_cost import validate_mass_cost
+        validate_mass_cost(c["hardware_mass_cost_weight"], c["hardware_mass_reference_kg"])
+        if c["hardware_mass_cost_weight"] > 0 and c.get("training_schedule") != "coadaptation":
+            raise ValueError("hardware mass cost requires training_schedule='coadaptation'")
         if "hardware_vtrace" in c:
             if not isinstance(c["hardware_vtrace"], bool):
                 raise ValueError("hardware_vtrace must be a boolean")
@@ -430,6 +481,7 @@ class CodesignRunner:
                                   physical=batch["physical"][i].tolist(), score=batch["scores"][i].item(),
                                   old_logprob=batch["old_logprob"][i].item(), baseline=batch["baseline"][i].item(),
                                   error=batch["compilation_errors"][i])
+                    record.update(batch.get("hardware_objective_records", {}).get(i, {}))
                     stream.write(json.dumps(record, allow_nan=False) + "\n")
         self.phase = "boundary"
         return metrics
@@ -541,11 +593,11 @@ class CodesignRunner:
             raise RuntimeError("Warm start requires a completed update boundary")
         data = torch.load(path, map_location=self.device, weights_only=False)
         if "policy" not in data and "actor_state_dict" in data:
-            self._warmstart_native(data)
-            self._fresh_warmstart_state(path, data.get("iter", 0), "native_conditioned")
+            changed_bounds = self._warmstart_native(data)
+            self._fresh_warmstart_state(path, data.get("iter", 0), "native_conditioned",
+                                        data["infos"]["codesign_transfer"]["space_schema"] if changed_bounds else None)
             return
-        if data.get("space_schema") != self._space_schema():
-            raise ValueError("Warm start requires the same explicit design-space schema")
+        transform = _warmstart_bound_transform(data.get("space_schema"), self._space_schema())
         if data.get("compiler_fingerprint") != getattr(self.compiler, "fingerprint", None):
             raise ValueError("Warm start changes the compiler source or dependency fingerprint")
         schema = data.get("control_schema")
@@ -556,21 +608,43 @@ class CodesignRunner:
         if schema and not self.control_initialized:
             self._ensure_control({key: torch.zeros((1, *shape), device=self.device)
                                   for key, shape in schema["observation_shapes"].items()}, schema["num_actions"])
-        self.policy.load_state_dict(data["policy"], strict=True)
+        source_policy = data["policy"]
+        if transform:
+            from .models import ConditionedMLPModel
+            if (self.policy.control is None or data["config"].get("obs_groups") != self.config.get("obs_groups")):
+                raise ValueError("Changed bounds require the same controller observation groups")
+            for role in ("actor", "critic"):
+                model = getattr(self.policy.control, role)
+                source_cfg = data["config"].get(role + "_cfg", {})
+                target_cfg = self.config.get(role + "_cfg", {})
+                if (not isinstance(model, ConditionedMLPModel)
+                        or source_cfg.get("class_name") != "draft.codesign.models:ConditionedMLPModel"
+                        or source_cfg != target_cfg):
+                    raise ValueError("Changed bounds require ConditionedMLPModel source and target controllers")
+                source_indices = data["config"].get("normalization_exclusions", {}).get(role, ())
+                dim = model.obs_dim
+                resolved = [index if index >= 0 else dim + index for index in source_indices]
+                if resolved != list(range(dim - len(transform[0]), dim)) or model.conditioning_dims != len(transform[0]):
+                    raise ValueError("Changed bounds require the same trailing morphology feature layout")
+                target_indices = self.policy.control.normalization_exclusions.get(role, ())
+                if list(target_indices) != resolved:
+                    raise ValueError("Changed bounds require the same trailing morphology feature layout")
+                source_policy = _remap_conditioned_weights(source_policy, "control." + role + ".", resolved, transform)
+        self.policy.load_state_dict(source_policy, strict=True)
         if hasattr(self.policy.control, "preserve_conditioning_scale"):
             self.policy.control.preserve_conditioning_scale()
-        if self.config["hardware_sampling_mode"] == "fixed":
+        if transform or self.config["hardware_sampling_mode"] == "fixed":
             self.policy.hardware.load_state_dict(self._hardware_prior_state, strict=True)
         self.control_schema = schema
-        self._fresh_warmstart_state(path, data["iteration"], data["config"].get("hardware_sampling_mode", "stochastic"))
+        self._fresh_warmstart_state(path, data["iteration"], data["config"].get("hardware_sampling_mode", "stochastic"),
+                                    data["space_schema"] if transform else None)
 
     def _warmstart_native(self, data):
         infos = data.get("infos")
         transfer = infos.get("codesign_transfer") if isinstance(infos, dict) else None
         if not isinstance(transfer, dict) or transfer.get("version") != 1:
             raise ValueError("Native warm start requires versioned infos.codesign_transfer with explicit design, observation and model schemas")
-        if transfer.get("space_schema") != self._space_schema():
-            raise ValueError("Native warm start requires the same explicit design-space schema")
+        transform = _warmstart_bound_transform(transfer.get("space_schema"), self._space_schema())
         fingerprint = transfer.get("compiler_fingerprint")
         if fingerprint is not None and fingerprint != getattr(self.compiler, "fingerprint", None):
             raise ValueError("Native warm start changes the compiler fingerprint")
@@ -585,6 +659,7 @@ class CodesignRunner:
         source_groups = transfer.get("obs_groups")
         if not isinstance(source_groups, dict) or {k: list(v) for k, v in source_groups.items()} != {k: list(v) for k, v in groups.items()}:
             raise ValueError("Native warm start observation group order mismatch")
+        layouts = {}
         for role in ("actor", "critic"):
             model_cfg = transfer.get(role + "_cfg")
             if not isinstance(model_cfg, dict):
@@ -606,16 +681,24 @@ class CodesignRunner:
             resolved = [index if index >= 0 else dimension + index for index in exclusions]
             if transfer.get("conditioning_layout", {}).get(role) != resolved:
                 raise ValueError("Native warm start morphology feature layout differs from the target; inputs cannot be reordered or padded implicitly")
+            layouts[role] = resolved
+            if transform and (model_cfg.get("class_name") != "draft.codesign.models:ConditionedMLPModel"
+                              or target_cfg.get("class_name") != "draft.codesign.models:ConditionedMLPModel"):
+                raise ValueError("Changed bounds require ConditionedMLPModel source and target controllers")
         if not self.control_initialized:
             obs = {key: torch.zeros((1, *shape), device=self.device) for key, shape in source_schema["observation_shapes"].items()}
             self._ensure_control(obs, source_schema["num_actions"])
-        self.policy.control.actor.load_state_dict(data["actor_state_dict"], strict=True)
-        self.policy.control.critic.load_state_dict(data["critic_state_dict"], strict=True)
+        for role in ("actor", "critic"):
+            state = data[role + "_state_dict"]
+            if transform:
+                state = _remap_conditioned_weights(state, "", layouts[role], transform)
+            getattr(self.policy.control, role).load_state_dict(state, strict=True)
         self.policy.control.preserve_conditioning_scale()
         self.policy.hardware.load_state_dict(self._hardware_prior_state, strict=True)
         self.control_schema = source_schema
+        return transform is not None
 
-    def _fresh_warmstart_state(self, path, source_iteration, source_sampling_mode):
+    def _fresh_warmstart_state(self, path, source_iteration, source_sampling_mode, source_space_schema=None):
         self.optimizer = torch.optim.Adam(self.policy.hardware.parameters(), lr=self.config["learning_rate"])
         if self.control_initialized:
             self._register_control()
@@ -629,6 +712,10 @@ class CodesignRunner:
                                           source_iteration=source_iteration,
                                           source_sampling_mode=source_sampling_mode,
                                           scope="network and normalizer transfer; fresh optimizer, counters and RNG")
+        if source_space_schema is not None:
+            self.metadata["warmstart"].update(source_space_schema=source_space_schema,
+                                              target_space_schema=self._space_schema(),
+                                              bounds_adaptation="affine controller input remap; fresh hardware prior")
 
     def _space_schema(self):
         space = self.compiler.space
@@ -681,10 +768,13 @@ class CodesignRunner:
                    "eval_interval", "eval_replicas", "final_evaluation", "final_export"}
         mutable.update({"eval_video_interval", "eval_video_length_s", "eval_video_fps", "eval_video_width", "eval_video_height"})
         mutable.add("eval_first_update")
+        mass_defaults = {"hardware_mass_cost_weight": 0., "hardware_mass_reference_kg": None}
         for key in set(self.config) | set(data["config"]):
             current, saved = self.config.get(key), data["config"].get(key)
             if key == "training_seed_offset" and saved is None:
                 saved = 0  # Checkpoints predating optional cohort seed offsets.
+            if key in mass_defaults and key not in data["config"]:
+                saved = mass_defaults[key]
             if key == "hardware_vtrace" and saved is None:
                 saved = False
             if key == "hardware_vtrace_cfg" and saved is None:

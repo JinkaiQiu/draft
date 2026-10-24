@@ -19,6 +19,8 @@ class CodesignRunnerCfg(QuadrupedLocomotionRunnerCfg):
     hardware_gamma: float = 1.0
     hardware_vtrace: bool = False
     hardware_vtrace_cfg: dict = field(default_factory=dict)
+    hardware_mass_cost_weight: float = 0.0
+    hardware_mass_reference_kg: float | None = None
     staleness_diagnostics: bool = True
     staleness_probe_samples_per_design: int = 64
     controller_updates_per_cycle: int = 20
@@ -71,6 +73,10 @@ class CodesignRunnerCfg(QuadrupedLocomotionRunnerCfg):
             raise ValueError("hardware_vtrace requires training_schedule='coadaptation'")
         from draft.codesign.vtrace import HardwareVTraceScorer
         HardwareVTraceScorer.validate_config(self.hardware_vtrace_cfg)
+        from draft.codesign.mass_cost import validate_mass_cost
+        validate_mass_cost(self.hardware_mass_cost_weight, self.hardware_mass_reference_kg)
+        if self.hardware_mass_cost_weight > 0 and self.training_schedule != "coadaptation":
+            raise ValueError("hardware_mass_cost_weight requires training_schedule='coadaptation'")
         if self.coadaptation_cohort_lifetime not in ("episode", "window"):
             raise ValueError("coadaptation_cohort_lifetime must be 'episode' or 'window'")
         if isinstance(self.hardware_gamma, bool) or not isinstance(self.hardware_gamma, (int, float)) or not math.isfinite(self.hardware_gamma) or not 0 <= self.hardware_gamma <= 1:

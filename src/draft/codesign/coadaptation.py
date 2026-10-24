@@ -296,6 +296,16 @@ class CoadaptationCodesignRunner(AlternatingCodesignRunner):
             training["vtrace_design_score_mae_from_raw"] = (
                 replica_returns.mean(-1) - raw_replica_returns.mean(-1)).abs().mean().item()
             training["vtrace_target_controller_iteration"] = training["controller_iterations"]
+        objective_records = None
+        if c["hardware_mass_cost_weight"] > 0:
+            from .mass_cost import apply_mass_cost
+            gamma, steps = c["hardware_gamma"], score.steps
+            discounted_steps = steps if gamma == 1 else (1 - gamma ** steps) / (1 - gamma)
+            replica_returns, cost_metrics, objective_records = apply_mass_cost(
+                replica_returns, getattr(env.unwrapped, "hardware_masses_kg", None),
+                reference_kg=c["hardware_mass_reference_kg"], weight=c["hardware_mass_cost_weight"],
+                discounted_seconds=discounted_steps * env.unwrapped.step_dt)
+            training.update(cost_metrics)
         training["HardwareTraining/replicas_per_design"] = c["replicas"]
         training["HardwareTraining/between_design_score_std"] = (
             replica_returns.mean(-1).std(unbiased=True).item() if num_designs > 1 else 0.)
@@ -318,15 +328,20 @@ class CoadaptationCodesignRunner(AlternatingCodesignRunner):
         self.reused_training_transitions += transitions
         self.controller_cycles += 1
         self.policy.eval()
-        return dict(replica_returns=replica_returns,
-                    scoring_steps=score.steps, score_accumulator_bytes=score.storage_bytes,
-                    true_terminations=int(score.true_terminations), timeouts=int(score.timeouts),
-                    controller_training=training)
+        result = dict(replica_returns=replica_returns,
+                      scoring_steps=score.steps, score_accumulator_bytes=score.storage_bytes,
+                      true_terminations=int(score.true_terminations), timeouts=int(score.timeouts),
+                      controller_training=training)
+        if objective_records is not None:
+            result["hardware_objective_records"] = objective_records
+        return result
 
     def update(self, batch):
         if self.phase != "collected":
             raise RuntimeError("Co-adaptation updates require a complete scored cohort")
         summary, training = batch["control"], batch["controller_training"]
+        if summary and summary.get("hardware_objective_records") is not None:
+            batch["hardware_objective_records"] = dict(zip(batch["valid_indices"], summary["hardware_objective_records"]))
         batch["control"] = None
         self.policy.eval()
         if self.policy.control is not None:

@@ -64,9 +64,13 @@ def augment_native_cohort_cfg(cfg, designs: Sequence[Any], replicas: int,
     tasks may opt into this seam explicitly in future.
     """
     cohort = prepare_cohort(designs, replicas)
+    masses = tuple(float(model.body_mass[1:].sum()) for model in cohort.robot_models)
+    if any(not math.isfinite(mass) or mass <= 0 for mass in masses):
+        raise ValueError("Each compiled hardware design must have positive finite body mass")
     reference_xml = Path(reference_xml).resolve()
     if cfg.scene.num_envs != cohort.num_envs:
         raise ValueError("Prebuilt task environment count must equal designs times replicas")
+    cfg.hardware_masses_kg = masses
     template = cfg.scene.entities["robot"]
     entities = [template]
     if len(cohort.designs) > 1:
@@ -110,6 +114,7 @@ def augment_native_cohort_cfg(cfg, designs: Sequence[Any], replicas: int,
                     ordering="design-major contiguous replicas", design_ids=[d.design_id for d in cohort.designs],
                     physical=[list(d.physical) for d in cohort.designs],
                     normalized=[list(d.morphology) for d in cohort.designs],
+                    hardware_masses_kg=list(masses),
                     task="authored task configuration; common explicit task geometry")
     if getattr(cfg, "hardware_aware", False):
         metadata.update(hardware_aware=True, nominal_stance_heights=list(cfg.hardware_nominal_heights))
@@ -303,6 +308,7 @@ class NativeCohortEnv(ManagerBasedRlEnv):
     def load_managers(self):
         info = self.cfg.native_cohort
         self.cohort = info.cohort
+        self.hardware_masses_kg = self.cfg.hardware_masses_kg
         self.design_index = torch.as_tensor(info.cohort.design_index, device=self.device)
         if len(info.cohort.designs) == 1:
             # Exact original native setup, startup DR and cached model defaults.

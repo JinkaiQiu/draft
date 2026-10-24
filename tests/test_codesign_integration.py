@@ -22,8 +22,14 @@ def test_registered_default_configuration_is_consistent():
     cfg.apply_overrides(run["runner_overrides"])
     cfg.env_kwargs = run["env_kwargs"]
     optimized = codesign_config(cfg)
-    assert optimized.n_envs == optimized.num_designs * optimized.replicas == 512
-    assert optimized.max_episode_length == 20
+    assert optimized.n_envs == optimized.num_designs * optimized.replicas == 4096
+    assert (optimized.num_designs, optimized.replicas) == (32, 128)
+    assert optimized.max_episode_length == 25.6 and optimized.horizon_steps == 1280
+    assert optimized.training_schedule == "coadaptation"
+    assert optimized.num_steps_per_env == 64 and optimized.controller_updates_per_cycle == 4
+    assert optimized.hardware_vtrace and optimized.hardware_gamma == 1.
+    assert optimized.hardware_mass_cost_weight == .05
+    assert optimized.hardware_mass_reference_kg == pytest.approx(32.63809926450245)
     assert optimized.schedule == "fixed"
     assert cfg.schedule == "adaptive"
     assert optimized.normalization_exclusions["actor"] == tuple(range(-7, 0))

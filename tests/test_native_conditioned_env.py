@@ -105,6 +105,11 @@ def test_hardware_aware_cohort_uses_per_design_posture_and_keeps_common_demands(
     cfg = make_native_env_cfg(native_designs, 2, xml, hardware_aware=True)
     heights = np.asarray(cfg.hardware_nominal_heights)
     assert len(heights) == 2 and not np.isclose(heights[0], heights[1])
+    expected_masses = tuple(float(model.body_mass[1:].sum())
+                            for model in cfg.native_cohort.cohort.robot_models)
+    assert cfg.hardware_masses_kg == expected_masses
+    assert all(math.isfinite(mass) and mass > 0 for mass in expected_masses)
+    assert cfg.morphology_conditioning_metadata["hardware_masses_kg"] == list(expected_masses)
     assert cfg.rewards["base_height"].func is TerrainRelativeHeightReward
     assert cfg.terminations["base_too_low"].func is TerrainRelativeCollapse
     assert "torso_contact" in cfg.terminations

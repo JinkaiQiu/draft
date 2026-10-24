@@ -36,6 +36,8 @@ _TAGS = {
     "vtrace_action_ess_fraction": "VTrace/action_ess_fraction",
     "vtrace_rho_clipped_fraction": "VTrace/clipped_fraction",
     "vtrace_value_loss": "VTrace/value_loss",
+    "hardware_task_score_mean": "HardwareReward/task",
+    "hardware_mass_penalty_mean": "HardwareReward/mass_cost",
 }
 
 # Constants and redundant summaries remain available in metrics.jsonl/config.

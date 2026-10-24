@@ -1,51 +1,69 @@
 # Optimized geometry is an opt-in special case of the quadruped task.
 task: quadruped
-run_name: quadruped_codesign
+run_name: cheetah_coadapt64_hw256_h1280_32x128_vtrace_mass
+log_dir: logs
 logger: tensorboard
+upload_model: false
 seed: 0
-device: cuda
+device: cuda:0
 
-n_envs: 512
-max_episode_length: 20.0
+n_envs: 4096
+num_steps_per_env: 64
+max_episode_length: 25.6
 max_iterations: 1000
 save_interval: 25
+schedule: adaptive
+warmstart_checkpoint: logs/cheetah_fixed_conditioned_native/2026-10-16_18-34-42_cheetah_fixed_conditioned_native/model_999.pt
 env_kwargs:
   robot_xml: generated/cheetah/quadruped.xml
   hardware_aware: true
 
 # Fixed/randomized conditioning retain native PPO.
-# Optimize alternates native controller PPO with frozen full-trial hardware PPO.
-# Set training_schedule: coadaptation to score the same controller-training
-# trajectories instead. Do not set hardware_evaluation_steps/hardware_bootstrap
-# in that mode; eval_interval still runs independent frozen validation trials.
+# Co-adaptation scores controller-training trajectories for hardware PPO.
+# Alternating frozen-trial batches require V-trace and mass cost disabled.
+# eval_interval still runs independent frozen validation trials.
 # Co-adaptation keeps worlds across update windows for at least one full native
 # episode (rounded up to a complete window). 'window' restores per-window rebuilds.
 # Hardware gamma is independent of the controller PPO discount.
 codesign:
   mode: optimize
-  training_schedule: alternating
+  training_schedule: coadaptation
   coadaptation_cohort_lifetime: episode
   hardware_gamma: 1.0
   # Optional latest-controller correction of hardware scores in coadaptation.
   # Retains one trajectory window on CPU; owns a separate finite-window critic.
-  hardware_vtrace: false
+  hardware_vtrace: true
   hardware_vtrace_cfg: {}
+  hardware_mass_cost_weight: 0.5
+  hardware_mass_reference_kg: 32.63809926450245
   staleness_diagnostics: true
   staleness_probe_samples_per_design: 64
-  controller_updates_per_cycle: 20
+  controller_updates_per_cycle: 4
   controller_schedule: adaptive
-  num_designs: 16
-  replicas: 32
+  num_designs: 32
+  replicas: 128
   compiler_workers: 0
   max_cache_entries: 128
   cache_dir: generated/codesign
-  geometry_relative_range: 0.15
+  geometry_relative_range: 0.5
   optimize_hardware: true
+  hardware_sampling_mode: stochastic
   hardware_std: 0.5
   hardware_loss_weight: 1.0
   hardware_target_kl: 0.02
   hardware_update_schedule: once_per_epoch
   terminal_penalty: -10.0
   invalid_design_return: -1000.0
+  max_training_design_attempts: 128
+  hardware_evaluation_steps: null
+  hardware_bootstrap: false
+  training_seed_offset: 0
+  horizon_steps: 1280
   eval_interval: 25
   eval_replicas: 16
+  eval_first_update: true
+  eval_video_interval: 25
+  eval_video_length_s: 10.0
+  eval_video_fps: 50
+  eval_video_width: 640
+  eval_video_height: 480

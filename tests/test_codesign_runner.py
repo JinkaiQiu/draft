@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import copy
 import json
 
 import numpy as np
@@ -409,6 +410,89 @@ def test_native_checkpoint_bridge_requires_verified_matching_schema_and_layout(t
         CodesignRunner(None, compiler, Env, dict(config, native_transfer_schema=wrong_schema)).warmstart(path)
     with pytest.raises(ValueError, match="feature layout"):
         CodesignRunner(None, compiler, Env, dict(config, normalization_exclusions={role: tuple(range(-8, -1)) for role in groups})).warmstart(path)
+
+
+def test_native_warmstart_changed_bounds_preserves_physical_controller_function(tmp_path):
+    pytest.importorskip("rsl_rl")
+    from draft.codesign.policy import NativeControlPolicy
+    from draft.codesign.space import DesignSpace
+
+    old_space = DesignSpace.quadruped(relative_range=.15)
+    new_space = DesignSpace.quadruped(relative_range=.5)
+    old_compiler, new_compiler = Compiler(), Compiler()
+    old_compiler.space, new_compiler.space = old_space, new_space
+    observation = {role: torch.randn(6, 55) for role in ("actor", "critic")}
+    actor = dict(class_name="draft.codesign.models:ConditionedMLPModel", hidden_dims=(8,), activation="elu",
+                 obs_normalization=True, distribution_cfg=dict(class_name="GaussianDistribution", init_std=.5, std_type="scalar"))
+    critic = dict(class_name="draft.codesign.models:ConditionedMLPModel", hidden_dims=(8,), activation="elu", obs_normalization=True)
+    groups = {role: [role] for role in ("actor", "critic")}
+    source = NativeControlPolicy.from_observation(observation, 12, actor, critic, groups,
+                                                   normalization_exclusions={role: tuple(range(-7, 0)) for role in groups})
+    source.update_normalization(observation)
+    with torch.no_grad():
+        for model in (source.actor, source.critic):
+            model.mlp[0].weight[:, -7:] = torch.arange(1, 8, dtype=torch.float32)[None, :] * .03
+    schema = dict(observation_shapes={role: [55] for role in groups}, num_actions=12)
+    config = dict(device="cpu", logger="none", actor_cfg=actor, critic_cfg=critic, obs_groups=groups,
+                  normalization_exclusions={role: tuple(range(-7, 0)) for role in groups}, native_transfer_schema=schema)
+    target = CodesignRunner(None, new_compiler, Env, config)
+    prior = {key: value.clone() for key, value in target.policy.hardware.state_dict().items()}
+    transfer = dict(version=1, space_schema=old_space.to_dict(), control_schema=schema,
+                    actor_cfg=actor, critic_cfg=critic, obs_groups=groups,
+                    conditioning_layout={role: list(range(48, 55)) for role in groups})
+    path = tmp_path / "native_old_bounds.pt"
+    torch.save(dict(actor_state_dict=source.actor.state_dict(), critic_state_dict=source.critic.state_dict(),
+                    iter=13, infos={"codesign_transfer": transfer}), path)
+    target.warmstart(path)
+    physical = np.asarray(old_space.center) * np.asarray([1.04, .96, 1.08, .94, 1.01, .92, 1.05])
+    old_input = torch.as_tensor(old_space.normalize(physical), dtype=torch.float32)
+    new_input = torch.as_tensor(new_space.normalize(physical), dtype=torch.float32)
+    for role in groups:
+        source_obs = {role: observation[role].clone()}
+        target_obs = {role: observation[role].clone()}
+        source_obs[role][:, -7:] = old_input
+        target_obs[role][:, -7:] = new_input
+        old_model, new_model = getattr(source, role), getattr(target.policy.control, role)
+        torch.testing.assert_close(new_model.mlp(new_model.get_latent(target_obs)),
+                                   old_model.mlp(old_model.get_latent(source_obs)), rtol=1e-5, atol=1e-5)
+    for key, value in target.policy.hardware.state_dict().items():
+        torch.testing.assert_close(value, prior[key], rtol=0, atol=0)
+    assert target.metadata["warmstart"]["source_space_schema"] == old_space.to_dict()
+    assert target.metadata["warmstart"]["target_space_schema"] == new_space.to_dict()
+    saved = torch.load(path, weights_only=False)
+    torch.testing.assert_close(saved["actor_state_dict"]["mlp.0.weight"], source.actor.state_dict()["mlp.0.weight"])
+
+    co_source = CodesignRunner(None, old_compiler, Env, config)
+    co_source._ensure_control(observation, 12)
+    co_source.policy.control.actor.load_state_dict(source.actor.state_dict())
+    co_source.policy.control.critic.load_state_dict(source.critic.state_dict())
+    with torch.no_grad():
+        co_source.policy.hardware.mean.fill_(.3)
+    co_path = tmp_path / "codesign_old_bounds.pt"
+    co_source.save(co_path)
+    co_target = CodesignRunner(None, new_compiler, Env, config)
+    co_target.warmstart(co_path)
+    for role in groups:
+        old_obs, new_obs = {role: observation[role].clone()}, {role: observation[role].clone()}
+        old_obs[role][:, -7:], new_obs[role][:, -7:] = old_input, new_input
+        old_model = getattr(co_source.policy.control, role)
+        new_model = getattr(co_target.policy.control, role)
+        torch.testing.assert_close(new_model.mlp(new_model.get_latent(new_obs)),
+                                   old_model.mlp(old_model.get_latent(old_obs)), rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(co_target.policy.hardware.mean, torch.zeros_like(co_target.policy.hardware.mean))
+    with pytest.raises(ValueError, match="design-space schema mismatch"):
+        CodesignRunner(None, new_compiler, Env, config).load(co_path)
+
+    bad_reference = copy.deepcopy(saved)
+    bad_reference["infos"]["codesign_transfer"]["space_schema"]["reference"]["battery_mass"] = 99
+    torch.save(bad_reference, path)
+    with pytest.raises(ValueError, match="reference, coordinate names and initial geometry"):
+        CodesignRunner(None, new_compiler, Env, config).warmstart(path)
+    bad_initial = copy.deepcopy(saved)
+    bad_initial["infos"]["codesign_transfer"]["space_schema"]["parameters"][0]["initial"] *= 1.01
+    torch.save(bad_initial, path)
+    with pytest.raises(ValueError, match="reference, coordinate names and initial geometry"):
+        CodesignRunner(None, new_compiler, Env, config).warmstart(path)
 
 
 def test_control_minibatch_cap_and_chunked_normalization_preserve_hardware_exposure():
