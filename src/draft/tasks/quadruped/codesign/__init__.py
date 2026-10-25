@@ -28,15 +28,19 @@ def train(runner_cfg, *, log_dir: str | Path, resume: str | None = None,
     runner_cfg.validate()
     space = DesignSpace.quadruped(bounds=runner_cfg.geometry_bounds,
                                   reference_overrides=runner_cfg.reference_overrides,
-                                  relative_range=runner_cfg.geometry_relative_range)
+                                  relative_range=runner_cfg.geometry_relative_range,
+                                  joint_topology=runner_cfg.joint_topology,
+                                  lock_angle_bounds=runner_cfg.lock_angle_bounds)
     config = dataclasses.asdict(runner_cfg)
     config["episode_length_s"] = runner_cfg.max_episode_length
     native = runner_cfg.build_rsl_rl_cfg()
     for role in ("actor", "critic"):
         native[role]["class_name"] = "draft.codesign.models:ConditionedMLPModel"
+        if runner_cfg.joint_topology:
+            native[role].update(conditioning_dims=space.dim, joint_topology=True)
     config.update(actor_cfg=native["actor"], critic_cfg=native["critic"],
                   obs_groups=native["obs_groups"], environment_family="quadruped_native",
-                  normalization_exclusions={role: tuple(range(-7, 0)) for role in ("actor", "critic")})
+                  normalization_exclusions={role: tuple(range(-space.dim, 0)) for role in ("actor", "critic")})
     native_controller = runner_cfg.training_schedule in ("alternating", "coadaptation")
     if native_controller:
         native["algorithm"]["schedule"] = runner_cfg.controller_schedule

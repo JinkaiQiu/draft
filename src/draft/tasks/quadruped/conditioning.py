@@ -22,8 +22,8 @@ class MorphologyObservation:
     def __init__(self, cfg, env):
         values = torch.as_tensor(cfg.params["values"], dtype=torch.float32, device=env.device)
         self.values = values.expand(env.num_envs, -1) if values.ndim == 1 else values
-        if self.values.shape != (env.num_envs, len(GEOMETRY_NAMES)):
-            raise ValueError("Morphology observation must have seven features per environment")
+        if self.values.shape not in ((env.num_envs, 7), (env.num_envs, 19)):
+            raise ValueError("Morphology observation must have seven or nineteen features per environment")
 
     def __call__(self, env, values) -> torch.Tensor:
         del env, values
@@ -32,15 +32,15 @@ class MorphologyObservation:
 
 def append_morphology_observations(cfg, values: Sequence[float] | np.ndarray,
                                    *, metadata: dict[str, Any] | None = None):
-    """Append seven features to actor/critic without changing any native terms.
+    """Append geometry or topology features to actor and critic.
 
     ``values`` may be one shared normalized vector or one vector per world.
     This API does not change terrain, rewards, reset state, action offsets,
     randomization, episode duration, or any other environment configuration.
     """
     values = np.asarray(values, dtype=np.float64)
-    if values.shape not in ((len(GEOMETRY_NAMES),), (cfg.scene.num_envs, len(GEOMETRY_NAMES))):
-        raise ValueError("Expected seven morphology features, shared or one row per environment")
+    if values.shape not in ((7,), (19,), (cfg.scene.num_envs, 7), (cfg.scene.num_envs, 19)):
+        raise ValueError("Expected seven or nineteen morphology features, shared or one row per environment")
     if not np.isfinite(values).all() or (np.abs(values) > 1.0 + 1e-5).any():
         raise ValueError("Morphology features must be finite and normalized to [-1, 1]")
     for name in ("actor", "critic"):
@@ -65,8 +65,10 @@ def describe_morphology(robot_xml: str | Path, *,
     space = DesignSpace.quadruped() if space is None else space
     if isinstance(space, dict):
         space = DesignSpace.from_dict(space)
-    if not isinstance(space, DesignSpace) or space.names != GEOMETRY_NAMES:
+    if not isinstance(space, DesignSpace) or tuple(space.names[:7]) != GEOMETRY_NAMES:
         raise ValueError("Morphology conditioning requires the complete ordered quadruped geometry space")
+    if space.topology_enabled:
+        raise ValueError("Standalone morphology conditioning supports geometry only; use native co-design for joint topology")
     xml_path = _resolve_robot_xml(Path(robot_xml)).resolve()
     candidates = tuple(xml_path.parent / name for name in (
         "parameters_resolved.yaml", "parameters_from_gui.yaml", "parameters.yaml"))

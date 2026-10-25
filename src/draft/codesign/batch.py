@@ -13,6 +13,8 @@ from typing import Any, Sequence
 import mujoco
 import numpy as np
 
+from .topology import expand_symmetric_topology
+
 LEGS = ("fl", "fr", "rl", "rr")
 JOINT_NAMES = tuple(f"{leg}_{role}" for leg in LEGS
                     for role in ("hip_roll", "hip_pitch", "knee"))
@@ -68,7 +70,7 @@ class PreparedCohort:
 
 
 def prepare_cohort(designs: Sequence[Any], replicas: int) -> PreparedCohort:
-    """Validate geometry-only 12-DOF designs and prepare their shared asset bank.
+    """Validate shared 12-joint geometry and optional lock topology.
 
     This path needs only NumPy and CPU MuJoCo; it never initializes CUDA or Torch.
     The environment performs a second, strict topology/array check after native
@@ -81,12 +83,21 @@ def prepare_cohort(designs: Sequence[Any], replicas: int) -> PreparedCohort:
         raise ValueError("a cohort must contain at least one design")
     bank, maps, models = [], [], []
     motor_signature = None
+    capacities = {}
     topology = None
+    topology_mode = None
     for index, design in enumerate(designs):
         path = Path(design.xml_path).resolve()
         morphology = np.asarray(design.morphology, dtype=float)
-        if morphology.shape != (7,) or not np.isfinite(morphology).all():
-            raise ValueError("each design requires seven finite morphology values")
+        declared = design.parameters.get("joint_topology")
+        is_topology = declared is not None
+        if topology_mode is not None and topology_mode != is_topology:
+            raise ValueError("cohort designs must share the joint equality topology")
+        topology_mode = is_topology
+        expected_dim = 19 if is_topology else 7
+        if morphology.shape != (expected_dim,) or not np.isfinite(morphology).all():
+            count = "nineteen" if is_topology else "seven"
+            raise ValueError(f"each design requires {count} finite morphology values")
         if not np.isfinite(design.leg_length) or design.leg_length <= 0:
             raise ValueError("leg_length must be finite and positive")
         model = mujoco.MjModel.from_xml_path(str(path))
@@ -98,25 +109,71 @@ def prepare_cohort(designs: Sequence[Any], replicas: int) -> PreparedCohort:
         if any(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name) < 0
                for name in FOOT_SITES):
             raise ValueError(f"{path}: all four named foot sites are required")
-        signature = (model.nbody, model.njnt, model.ngeom, model.nsite, names,
+        signature = (model.nbody, model.njnt, model.ngeom, model.nsite, model.neq, names,
                      tuple(model.jnt_type), tuple(model.geom_type),
                      tuple(model.body(i).name for i in range(model.nbody)),
                      tuple(model.geom(i).name for i in range(model.ngeom)),
-                     tuple(model.site(i).name for i in range(model.nsite)))
+                     tuple(model.site(i).name for i in range(model.nsite)),
+                     tuple(model.eq_type), tuple(model.eq_obj1id),
+                     tuple(model.eq_obj2id),
+                     tuple(model.equality(i).name for i in range(model.neq)))
         if topology is not None and signature != topology:
             raise ValueError("cohort designs must have identical body/joint/geom/site topology")
         topology = signature
+        active = np.ones(12, dtype=bool)
+        if is_topology:
+            try:
+                active, angles = expand_symmetric_topology(
+                    declared["active"], declared["lock_angles"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("invalid joint_topology mapping") from exc
+            active = np.asarray(active, dtype=bool)
+            if model.neq != 12 or np.any(model.eq_active0) or not np.all(
+                    model.eq_type == mujoco.mjtEq.mjEQ_JOINT):
+                raise ValueError("topology designs require twelve inactive joint equalities")
+            for slot, name in enumerate(JOINT_NAMES):
+                jid = model.joint(name).id
+                if (model.equality(slot).name != f"lock_{name}"
+                        or model.eq_obj1id[slot] != jid
+                        or model.eq_obj2id[slot] != -1
+                        or not np.isclose(model.eq_data[slot, 0],
+                                          angles[slot] - model.qpos0[model.jnt_qposadr[jid]],
+                                          atol=1e-9)):
+                    raise ValueError("joint equality structure does not match topology coordinates")
+                dof = model.jnt_dofadr[jid]
+                if not active[slot] and (model.dof_armature[dof] != 0
+                                         or model.dof_damping[dof] != 0
+                                         or model.dof_frictionloss[dof] != 0):
+                    raise ValueError("frozen joints must have zero rotor and friction terms")
+                if active[slot] and (model.jnt_actfrcrange[jid, 1] <= 0
+                                     or model.dof_armature[dof] <= 0):
+                    raise ValueError("active joints must retain their motor capacity")
+        elif model.neq:
+            raise ValueError("legacy designs cannot declare joint equalities")
         # Motor effort, speed, gear and topology must not become optimization variables.
         speeds = tuple((model.numeric(i).name, tuple(model.numeric(i).data))
                        for i in range(model.nnumeric)
                        if model.numeric(i).name.endswith("_velocity_limit"))
         motors = (model.nu, tuple(model.actuator_trnid.ravel()),
                   tuple(model.actuator_forcerange.ravel()), tuple(model.actuator_gear.ravel()),
-                  tuple(model.jnt_actfrcrange.ravel()), tuple(model.dof_armature.ravel()), speeds)
+                  tuple(model.jnt_actfrcrange.ravel()),
+                  tuple(model.jnt_actfrclimited), speeds)
         if model.nu not in (0, 12) or len(speeds) != 12 or (
                 motor_signature is not None and motors != motor_signature):
             raise ValueError("all designs must use the same 12 motors, gear ratios and speed limits")
         motor_signature = motors
+        # Compare capacities only where both designs actually retain a motor.
+        # Frozen joints deliberately have zero force, armature, friction, and damping.
+        for slot, name in enumerate(JOINT_NAMES):
+            if not active[slot]:
+                continue
+            jid = model.joint(name).id
+            dof = model.jnt_dofadr[jid]
+            capacity = (tuple(model.jnt_actfrcrange[jid]), model.dof_armature[dof],
+                        model.dof_damping[dof], model.dof_frictionloss[dof])
+            if slot in capacities and capacities[slot] != capacity:
+                raise ValueError("all active joints must use the same 12 motors and capacities")
+            capacities[slot] = capacity
         spec = mujoco.MjSpec.from_file(str(path))
         mapping = {}
         for mesh in spec.meshes:

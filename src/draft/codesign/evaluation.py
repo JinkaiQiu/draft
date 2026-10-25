@@ -294,6 +294,11 @@ def export(runner, destination):
     with tempfile.TemporaryDirectory(prefix=".export-", dir=destination.parent) as temporary:
         stage = Path(temporary)
         shutil.copytree(result.design.xml_path.parent, stage / "robot")
+        topology = result.design.parameters.get("joint_topology")
+        topology_export = None
+        if topology is not None:
+            from .topology_physics import prepare_exported_topology
+            topology_export = prepare_exported_topology(stage / "robot" / result.design.xml_path.name, topology)
         (stage / "selected_parameters.yaml").write_text(yaml.safe_dump(result.design.parameters, sort_keys=False))
         runner.save(stage / "joint_checkpoint.pt")
         torch.save(dict(actor_state_dict=runner.policy.control.actor.state_dict(),
@@ -308,6 +313,8 @@ def export(runner, destination):
                         compiler_fingerprint=getattr(runner.compiler, "fingerprint", None),
                         files={str(path.relative_to(stage)): hashlib.sha256(path.read_bytes()).hexdigest()
                                for path in sorted(stage.rglob("*")) if path.is_file()})
+        if topology_export is not None:
+            manifest["joint_topology"] = topology_export
         (stage / "manifest.json").write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n")
         os.replace(stage, destination)
     return destination

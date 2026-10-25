@@ -201,8 +201,10 @@ class CoadaptationCodesignRunner(AlternatingCodesignRunner):
                                         born=self.iteration, first_done=torch.zeros(self._cohort["env"].num_envs, dtype=torch.bool,
                                                                                  device=self.device),
                                         lengths=torch.zeros(self._cohort["env"].num_envs, dtype=torch.long, device=self.device),
-                                        behavior_mean=self.policy.hardware.mean.detach().clone(),
-                                        behavior_std=self.policy.hardware.log_std.detach().exp().clone())
+                                        behavior=(self.policy.hardware.distribution_state()
+                                                  if hasattr(self.policy.hardware, "distribution_state") else
+                                                  (self.policy.hardware.mean.detach().clone(),
+                                                   self.policy.hardware.log_std.detach().exp().clone())))
                 else:
                     # No world was built, but every rejected raw draw still trains hardware.
                     batch = template
@@ -226,7 +228,7 @@ class CoadaptationCodesignRunner(AlternatingCodesignRunner):
                     cohort_interrupted_episode_mean_length=(cohort["lengths"].sum().item() /
                         max(int((cohort["lengths"] > 0).sum()), 1)) if replacing else 0.,
                     resume_cohort_restarts=self.resume_cohort_restarts)
-                batch["hardware_behavior"] = (cohort["behavior_mean"], cohort["behavior_std"])
+                batch["hardware_behavior"] = cohort["behavior"]
                 if replacing:
                     self._close_cohort()
             summary = batch["control"]
@@ -297,15 +299,36 @@ class CoadaptationCodesignRunner(AlternatingCodesignRunner):
                 replica_returns.mean(-1) - raw_replica_returns.mean(-1)).abs().mean().item()
             training["vtrace_target_controller_iteration"] = training["controller_iterations"]
         objective_records = None
-        if c["hardware_mass_cost_weight"] > 0:
-            from .mass_cost import apply_mass_cost
+        mass_enabled = c["hardware_mass_cost_weight"] > 0
+        joint_enabled = c["hardware_joint_cost_weight"] > 0
+        if mass_enabled or joint_enabled:
+            # Keep the uncharged, corrected task estimate for every design.
+            task_scores = replica_returns.mean(-1).cpu().tolist()
+            objective_records = [dict(task_score=value) for value in task_scores]
             gamma, steps = c["hardware_gamma"], score.steps
             discounted_steps = steps if gamma == 1 else (1 - gamma ** steps) / (1 - gamma)
-            replica_returns, cost_metrics, objective_records = apply_mass_cost(
+            discounted_seconds = discounted_steps * env.unwrapped.step_dt
+            training["hardware_task_score_mean"] = replica_returns.mean(-1).mean().item()
+        if mass_enabled:
+            from .mass_cost import apply_mass_cost
+            replica_returns, cost_metrics, mass_records = apply_mass_cost(
                 replica_returns, getattr(env.unwrapped, "hardware_masses_kg", None),
                 reference_kg=c["hardware_mass_reference_kg"], weight=c["hardware_mass_cost_weight"],
-                discounted_seconds=discounted_steps * env.unwrapped.step_dt)
+                discounted_seconds=discounted_seconds)
             training.update(cost_metrics)
+            for record, cost_record in zip(objective_records, mass_records):
+                record.update({key: value for key, value in cost_record.items() if key != "task_score"})
+        if joint_enabled:
+            from .joint_cost import active_joint_counts, apply_joint_cost
+            counts = active_joint_counts(getattr(env.unwrapped, "hardware_action_mask", None),
+                                         num_designs=num_designs, replicas=c["replicas"])
+            replica_returns, cost_metrics, joint_records = apply_joint_cost(
+                replica_returns, counts, weight=c["hardware_joint_cost_weight"],
+                discounted_seconds=discounted_seconds)
+            training.update({key: value for key, value in cost_metrics.items()
+                             if key != "hardware_task_score_mean"})
+            for record, cost_record in zip(objective_records, joint_records):
+                record.update({key: value for key, value in cost_record.items() if key != "task_score"})
         training["HardwareTraining/replicas_per_design"] = c["replicas"]
         training["HardwareTraining/between_design_score_std"] = (
             replica_returns.mean(-1).std(unbiased=True).item() if num_designs > 1 else 0.)
@@ -379,10 +402,13 @@ class CoadaptationCodesignRunner(AlternatingCodesignRunner):
                    prefix + "clip_fraction": ((delta.exp() - 1).abs() > self.config["clip_param"]).float().mean().item(),
                    prefix + "sampled_ess_fraction": (ess / len(delta)).item()}
         if "hardware_behavior" in batch:
-            mean, std = batch["hardware_behavior"]
-            current = self.policy.hardware.distribution()
-            metrics[prefix + "kl"] = torch.distributions.kl_divergence(
-                torch.distributions.Normal(mean, std), current).sum().item()
+            behavior = batch["hardware_behavior"]
+            if isinstance(behavior, dict):
+                metrics[prefix + "kl"] = self.policy.hardware.kl_from_state(behavior).item()
+            else:
+                mean, std = behavior
+                metrics[prefix + "kl"] = torch.distributions.kl_divergence(
+                    torch.distributions.Normal(mean, std), self.policy.hardware.distribution()).sum().item()
         for index, value in enumerate(delta.tolist()):
             metrics[prefix + f"Design_{index}/log_ratio"] = value
         return metrics

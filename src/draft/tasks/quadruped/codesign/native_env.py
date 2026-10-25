@@ -23,8 +23,9 @@ from mjlab.scene import Scene
 from mjlab.utils.string import resolve_expr
 
 from draft.codesign.batch import (
-    HeterogeneousModelAdapter, PreparedCohort, prepare_cohort,
+    HeterogeneousModelAdapter, JOINT_NAMES, PreparedCohort, prepare_cohort,
 )
+from draft.codesign.topology import expand_symmetric_topology
 from draft.tasks.quadruped.base_env import make_base_env_cfg
 from draft.tasks.quadruped.conditioning import append_morphology_observations
 
@@ -52,6 +53,92 @@ def _preserve_mesh_bank(spec: mujoco.MjSpec) -> None:
             # Required only to compile every bank entry's native convex hull.
             # Task geoms use bit1; static bank refs use bit2, 1km underground.
             geom.contype = geom.conaffinity = 2
+
+
+def _topology_rows(cohort: PreparedCohort):
+    widths = {len(design.morphology) for design in cohort.designs}
+    if widths == {7}:
+        return None
+    if widths != {19}:
+        raise ValueError("A native cohort must use one complete seven- or nineteen-feature morphology schema")
+    masks, angles = [], []
+    for design in cohort.designs:
+        physical = np.asarray(design.physical, dtype=float)
+        parameters = design.parameters.get("joint_topology")
+        if physical.shape != (19,) or not isinstance(parameters, dict):
+            raise ValueError("Topology designs require nineteen physical coordinates and joint_topology metadata")
+        active = np.asarray(parameters.get("active"), dtype=float)
+        locked = np.asarray(parameters.get("lock_angles"), dtype=float)
+        if active.shape != (6,) or locked.shape != (6,):
+            raise ValueError("joint_topology requires paired active and lock_angles arrays of length six")
+        if not np.array_equal(active, physical[7:13]) or not np.allclose(locked, physical[13:19], atol=1e-8):
+            raise ValueError("joint_topology metadata differs from compiled physical coordinates")
+        mask, angle = expand_symmetric_topology(active, locked)
+        masks.append(mask.astype(bool))
+        angles.append(angle)
+    return np.asarray(masks), np.asarray(angles)
+
+
+def _stance_height_for_pose(model, joint_positions):
+    data = mujoco.MjData(model)
+    data.qpos[:] = 0
+    data.qpos[3] = 1
+    for name, value in zip(JOINT_NAMES, joint_positions):
+        joint = model.joint(name)
+        data.qpos[model.jnt_qposadr[joint.id]] = value
+    mujoco.mj_forward(model, data)
+    foot_heights = []
+    for leg in ("fl", "fr", "rl", "rr"):
+        geom = model.geom(f"{leg}_lower_leg_link_sphere")
+        foot_heights.append(float(data.geom_xpos[geom.id, 2] - model.geom_size[geom.id, 0]))
+    height = float(data.xpos[model.body("torso_link").id, 2] - min(foot_heights))
+    if not math.isfinite(height) or height <= 0:
+        raise ValueError("Locked posture must have a positive finite nominal stance height")
+    return height
+
+
+def _apply_topology_cfg(cfg, cohort, entities, rows):
+    from .topology_mdp import (active_action_rate_l2, active_joint_pos_limits,
+                               paired_encoder_bias, reset_joints_topology)
+
+    masks, angles = rows
+    heights = []
+    for index, (entity, model) in enumerate(zip(entities, cohort.robot_models)):
+        stance = resolve_expr(entity.init_state.joint_pos, JOINT_NAMES, 0.0)
+        pose = np.where(masks[index], stance, angles[index])
+        for name, value in zip(JOINT_NAMES, pose):
+            joint = model.joint(name)
+            lower, upper = model.jnt_range[joint.id]
+            if not lower <= value <= upper:
+                raise ValueError(f"Locked posture exceeds joint range: {name}")
+        entity.init_state.joint_pos = dict(zip(JOINT_NAMES, map(float, pose)))
+        height = _stance_height_for_pose(model, pose)
+        entity.init_state.pos = (*entity.init_state.pos[:2], height)
+        heights.append(height)
+    cfg.hardware_action_mask = np.repeat(masks, cohort.replicas, axis=0).tolist()
+    cfg.hardware_joint_mask = cfg.hardware_action_mask
+    cfg.hardware_lock_angles = np.repeat(angles, cohort.replicas, axis=0).tolist()
+    reset = cfg.events.get("reset_robot_joints")
+    if reset is None:
+        raise ValueError("Topology requires the native reset_robot_joints event")
+    reset.func = reset_joints_topology
+    # The authored foot-friction event already shares one draw across all feet.
+    # A lateral torso COM offset would break the paired left/right hardware.
+    base_com = cfg.events.get("base_com")
+    if base_com is not None:
+        base_com.params["ranges"][1] = (0.0, 0.0)
+    encoder_bias = cfg.events.get("encoder_bias")
+    if encoder_bias is not None:
+        encoder_bias.func = paired_encoder_bias
+    for name, func in (("action_rate_l2", active_action_rate_l2),
+                       ("dof_pos_limits", active_joint_pos_limits)):
+        if name in cfg.rewards:
+            cfg.rewards[name].func = func
+            cfg.rewards[name].params = {}
+    if getattr(cfg, "hardware_aware", False):
+        from draft.tasks.quadruped.hardware import set_hardware_heights
+        set_hardware_heights(cfg, heights, cohort.replicas)
+    return heights
 
 
 def augment_native_cohort_cfg(cfg, designs: Sequence[Any], replicas: int,
@@ -107,9 +194,13 @@ def augment_native_cohort_cfg(cfg, designs: Sequence[Any], replicas: int,
         else:
             heights = cfg.hardware_nominal_heights
         set_hardware_heights(cfg, heights, replicas)
+    topology = _topology_rows(cohort)
+    if topology is not None:
+        _apply_topology_cfg(cfg, cohort, entities, topology)
     values = np.asarray([design.morphology for design in cohort.designs], dtype=float)
     values = np.repeat(values, cohort.replicas, axis=0)
-    metadata = dict(version=1, observation_term="morphology", reference_xml=str(reference_xml),
+    metadata = dict(version=2 if topology is not None else 1,
+                    observation_term="morphology", reference_xml=str(reference_xml),
                     num_designs=len(cohort.designs), replicas=cohort.replicas,
                     ordering="design-major contiguous replicas", design_ids=[d.design_id for d in cohort.designs],
                     physical=[list(d.physical) for d in cohort.designs],
@@ -118,6 +209,9 @@ def augment_native_cohort_cfg(cfg, designs: Sequence[Any], replicas: int,
                     task="authored task configuration; common explicit task geometry")
     if getattr(cfg, "hardware_aware", False):
         metadata.update(hardware_aware=True, nominal_stance_heights=list(cfg.hardware_nominal_heights))
+    if topology is not None:
+        metadata.update(topology_enabled=True, joint_names=list(JOINT_NAMES),
+                        action_masks=np.asarray(cfg.hardware_action_mask, dtype=int).tolist())
     append_morphology_observations(cfg, values, metadata=metadata)
     cfg.native_cohort = NativeCohort(cohort, tuple(entities), reference_xml)
     return cfg
@@ -305,6 +399,54 @@ class HardwareAwareEnv(ManagerBasedRlEnv):
 
 
 class NativeCohortEnv(ManagerBasedRlEnv):
+    def _install_topology(self):
+        if not hasattr(self.cfg, "hardware_action_mask"):
+            return
+        robot = self.scene["robot"]
+        joint_mask = torch.as_tensor(self.cfg.hardware_joint_mask, dtype=torch.bool,
+                                     device=self.device)
+        self.hardware_joint_mask = joint_mask[:, [JOINT_NAMES.index(name) for name in robot.joint_names]]
+        action_names = self.action_manager.get_term("joint_pos").target_names
+        if tuple(action_names) != JOINT_NAMES:
+            raise ValueError("Topology controller requires canonical leg-major action order")
+        self.hardware_action_mask = joint_mask[:, [JOINT_NAMES.index(name) for name in action_names]]
+        if self.hardware_action_mask.shape != (self.num_envs, self.action_manager.total_action_dim):
+            raise ValueError("Topology mask does not match the native action order")
+        self.hardware_eq_ids = tuple(self.sim.mj_model.equality(f"robot/lock_{name}").id
+                                     for name in JOINT_NAMES)
+        if len(set(self.hardware_eq_ids)) != 12:
+            raise ValueError("Topology requires twelve distinct named equality constraints")
+        self.hardware_eq_active = ~joint_mask
+        self.sim.data.eq_active[:, list(self.hardware_eq_ids)] = self.hardware_eq_active
+        # Native actuators compute PD torque even when the policy action is zero.
+        # Zero both torque ceilings on frozen slots, leaving equality constraints
+        # as the sole source of their joint force.
+        covered = set()
+        for actuator in robot._custom_actuators:
+            if actuator.force_limit is None or not hasattr(actuator, "saturation_effort"):
+                raise ValueError("Topology requires native DC motor actuators with per-world torque limits")
+            local = [JOINT_NAMES.index(name) for name in actuator.target_names]
+            mask = joint_mask[:, local]
+            actuator.force_limit.mul_(mask)
+            actuator.saturation_effort.mul_(mask)
+            covered.update(local)
+        if covered != set(range(12)):
+            raise ValueError("Topology requires twelve native DC motor slots")
+
+    def _reset_idx(self, env_ids=None):
+        super()._reset_idx(env_ids)
+        if hasattr(self, "hardware_eq_ids"):
+            ids = torch.as_tensor(self.hardware_eq_ids, dtype=torch.long, device=self.device)
+            if env_ids is None:
+                self.sim.data.eq_active[:, ids] = self.hardware_eq_active
+            else:
+                self.sim.data.eq_active[env_ids[:, None], ids[None, :]] = self.hardware_eq_active[env_ids]
+
+    def step(self, action):
+        if hasattr(self, "hardware_action_mask"):
+            action = action * self.hardware_action_mask
+        return super().step(action)
+
     def load_managers(self):
         info = self.cfg.native_cohort
         self.cohort = info.cohort
@@ -314,7 +456,9 @@ class NativeCohortEnv(ManagerBasedRlEnv):
             # Exact original native setup, startup DR and cached model defaults.
             self.cpu_models = (self.sim.mj_model,)
             _validate_hardware_terrain(self.cfg, self.cpu_models)
-            return super().load_managers()
+            result = super().load_managers()
+            self._install_topology()
+            return result
         balance_cohort_terrain(self.scene, len(info.cohort.designs), info.cohort.replicas)
         self.cpu_models = compile_cohort_models(self.scene, self.cfg, info)
         _validate_hardware_terrain(self.cfg, self.cpu_models)
@@ -355,9 +499,11 @@ class NativeCohortEnv(ManagerBasedRlEnv):
         self.sim.expand_model_fields = lambda fields: expand(tuple(
             name for name in fields if name not in self.sim.expanded_fields))
         try:
-            super().load_managers()
+            result = super().load_managers()
         finally:
             self.sim.expand_model_fields = expand
+        self._install_topology()
+        return result
 
     def close(self):
         try:

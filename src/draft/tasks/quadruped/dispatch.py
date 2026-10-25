@@ -56,7 +56,8 @@ def codesign_config(config):
     designs = values.get("num_designs", 16)
     if "replicas" not in options and isinstance(designs, int) and designs > 0 and values["n_envs"] % designs == 0:
         values["replicas"] = values["n_envs"] // designs
-    values["normalization_exclusions"] = {"actor": tuple(range(-7, 0)), "critic": tuple(range(-7, 0))}
+    dimensions = 19 if values.get("joint_topology", False) else 7
+    values["normalization_exclusions"] = {role: tuple(range(-dimensions, 0)) for role in ("actor", "critic")}
     resolved = CodesignRunnerCfg(**values)
     resolved.validate()
     if not resolved.optimize_hardware and not fixed_cohort:

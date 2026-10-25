@@ -21,6 +21,7 @@ class CodesignRunnerCfg(QuadrupedLocomotionRunnerCfg):
     hardware_vtrace_cfg: dict = field(default_factory=dict)
     hardware_mass_cost_weight: float = 0.0
     hardware_mass_reference_kg: float | None = None
+    hardware_joint_cost_weight: float = 0.0
     staleness_diagnostics: bool = True
     staleness_probe_samples_per_design: int = 64
     controller_updates_per_cycle: int = 20
@@ -38,6 +39,10 @@ class CodesignRunnerCfg(QuadrupedLocomotionRunnerCfg):
     geometry_bounds: dict = field(default_factory=dict)
     reference_overrides: dict = field(default_factory=dict)
     geometry_relative_range: float = 0.15
+    joint_topology: bool = False
+    lock_angle_bounds: dict = field(default_factory=dict)
+    hardware_hidden_dims: tuple[int, ...] = (64, 64)
+    topology_initial_active_probability: float = 0.9
     optimize_hardware: bool = True
     hardware_sampling_mode: str = "stochastic"
     normalization_exclusions: dict = field(default_factory=lambda: {
@@ -63,6 +68,20 @@ class CodesignRunnerCfg(QuadrupedLocomotionRunnerCfg):
     eval_video_height: int = 480
 
     def validate(self) -> None:
+        if not isinstance(self.joint_topology, bool):
+            raise ValueError("joint_topology must be a boolean")
+        if self.joint_topology and self.training_schedule != "coadaptation":
+            raise ValueError("joint_topology currently requires training_schedule='coadaptation'")
+        if not isinstance(self.lock_angle_bounds, dict):
+            raise ValueError("lock_angle_bounds must be a mapping")
+        if not self.joint_topology and self.lock_angle_bounds:
+            raise ValueError("lock_angle_bounds requires joint_topology")
+        if not self.hardware_hidden_dims or any(isinstance(n, bool) or not isinstance(n, int) or n < 1
+                                                for n in self.hardware_hidden_dims):
+            raise ValueError("hardware_hidden_dims must contain positive integers")
+        probability = self.topology_initial_active_probability
+        if isinstance(probability, bool) or not isinstance(probability, (int, float)) or not 0 < probability < 1:
+            raise ValueError("topology_initial_active_probability must be in (0, 1)")
         if isinstance(self.training_seed_offset, bool) or not isinstance(self.training_seed_offset, int) or self.training_seed_offset < 0:
             raise ValueError("training_seed_offset must be a nonnegative integer")
         if self.training_schedule not in ("full_window", "alternating", "coadaptation"):
@@ -77,6 +96,11 @@ class CodesignRunnerCfg(QuadrupedLocomotionRunnerCfg):
         validate_mass_cost(self.hardware_mass_cost_weight, self.hardware_mass_reference_kg)
         if self.hardware_mass_cost_weight > 0 and self.training_schedule != "coadaptation":
             raise ValueError("hardware_mass_cost_weight requires training_schedule='coadaptation'")
+        from draft.codesign.joint_cost import validate_joint_cost
+        validate_joint_cost(self.hardware_joint_cost_weight)
+        if self.hardware_joint_cost_weight > 0 and (
+                self.training_schedule != "coadaptation" or not self.joint_topology):
+            raise ValueError("hardware_joint_cost_weight requires coadaptation and joint_topology=True")
         if self.coadaptation_cohort_lifetime not in ("episode", "window"):
             raise ValueError("coadaptation_cohort_lifetime must be 'episode' or 'window'")
         if isinstance(self.hardware_gamma, bool) or not isinstance(self.hardware_gamma, (int, float)) or not math.isfinite(self.hardware_gamma) or not 0 <= self.hardware_gamma <= 1:

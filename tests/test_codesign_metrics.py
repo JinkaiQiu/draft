@@ -78,6 +78,31 @@ def test_legacy_full_window_control_losses_and_transition_counts_remain_visible(
                        "HardwareLoss/policy": .1}
 
 
+def test_topology_distribution_has_four_cards_and_preserves_raw_values():
+    metrics = {f"HardwareTopology/probability_{index:02d}": index / 2016 for index in range(64)}
+    metrics.update({"HardwareTopology/entropy": 3.5, "HardwareTopology/mean_active_joints": 10.8,
+                    "hardware_active_joint_count_mean": 11., "HardwareReward/task": 4.})
+    before = metrics.copy()
+    assert tensorboard_scalars(metrics) == {
+        "HardwareTopology/entropy": 3.5, "HardwareTopology/max_probability": 63 / 2016,
+        "HardwareTopology/expected_active_joints": 10.8, "HardwareTopology/sampled_active_joints": 11.,
+        "HardwareReward/task": 4.,
+    }
+    assert metrics == before
+
+
+def test_canonical_topology_summaries_win_aliases_in_any_order():
+    metrics = {f"HardwareTopology/probability_{index:02d}": 1 / 64 for index in range(64)}
+    metrics.update({"HardwareTopology/expected_active_joints": 9., "HardwareTopology/mean_active_joints": 8.,
+                    "HardwareTopology/sampled_active_joints": 10., "HardwareTopology/active_joint_count": 7.,
+                    "hardware_active_joint_count_mean": 6., "HardwareTopology/max_probability": .5})
+    expected = {"HardwareTopology/expected_active_joints": 9., "HardwareTopology/sampled_active_joints": 10.,
+                "HardwareTopology/max_probability": .5}
+    assert tensorboard_scalars(metrics) == expected
+    assert tensorboard_scalars(dict(reversed(list(metrics.items())))) == expected
+    assert tensorboard_scalars({"HardwareTopology/probability_00": .1}) == {}
+
+
 def test_runner_routes_writer_only_and_preserves_raw_jsonl(tmp_path):
     pytest.importorskip("torch")
     from test_codesign_runner import make_runner

@@ -18,7 +18,7 @@ import time
 import numpy as np
 import torch
 
-from .policy import HardwarePolicy, JointPolicy, NativeControlPolicy
+from .policy import HardwarePolicy, JointPolicy, NativeControlPolicy, TopologyHardwarePolicy
 from .metrics import tensorboard_scalars
 
 
@@ -35,6 +35,9 @@ def _warmstart_bound_transform(source, target):
     if not isinstance(source, dict) or not isinstance(target, dict):
         raise ValueError("Warm start requires an explicit design-space schema")
     old, new = copy.deepcopy(source), copy.deepcopy(target)
+    if source.get("version") == 1 and target.get("version") == 2:
+        raise ValueError("Warm start requires a shape-compatible topology checkpoint. Expand it offline with "
+                         "scripts/expand_codesign_checkpoint.py --input SOURCE --output DESTINATION first.")
     if "parameters" in old and "parameters" in new:
         old_bounds = [(p.pop("lower"), p.pop("upper")) for p in old["parameters"]]
         new_bounds = [(p.pop("lower"), p.pop("upper")) for p in new["parameters"]]
@@ -52,8 +55,11 @@ def _warmstart_bound_transform(source, target):
             or np.any(new_bounds[:, 1] <= new_bounds[:, 0])):
         raise ValueError("Warm start design bounds must be finite ordered pairs")
     old_width = old_bounds[:, 1] - old_bounds[:, 0]
-    return ((new_bounds[:, 1] - new_bounds[:, 0]) / old_width,
-            (new_bounds.sum(axis=1) - old_bounds.sum(axis=1)) / old_width)
+    scale = (new_bounds[:, 1] - new_bounds[:, 0]) / old_width
+    offset = (new_bounds.sum(axis=1) - old_bounds.sum(axis=1)) / old_width
+    if source.get("version") == 2:
+        scale, offset = np.r_[scale, np.ones(12)], np.r_[offset, np.zeros(12)]
+    return scale, offset
 
 
 def _remap_conditioned_weights(state, prefix, indices, transform):
@@ -122,7 +128,9 @@ class CodesignRunner:
                     num_mini_batches=4, desired_kl=.01, hardware_target_kl=.02,
                     hardware_loss_weight=1., hardware_value_loss_coef=.5, hardware_entropy_coef=0.,
                     hardware_mass_cost_weight=0., hardware_mass_reference_kg=None,
+                    hardware_joint_cost_weight=0.,
                     terminal_penalty=-10., invalid_design_return=-1000., hardware_std=.5,
+                    joint_topology=False, hardware_hidden_dims=(64, 64), topology_initial_active_probability=.9,
                     optimize_hardware=True, hardware_sampling_mode="stochastic", logger="tensorboard", wandb_project="draft_codesign",
                     use_clipped_value_loss=True, schedule="fixed",
                     eval_interval=25, eval_replicas=16, final_evaluation=True, final_export=True,
@@ -150,9 +158,18 @@ class CodesignRunner:
         self.hardware_generator.manual_seed(self.config["seed"] + 8_675_309)
         self.compiler, self.env_factory = compiler, env_factory
         initial = compiler.space.normalize(compiler.space.center) if hasattr(compiler.space, "normalize") else None
-        self.policy = policy or JointPolicy(None, HardwarePolicy(compiler.space.dim, self.config["hardware_std"], initial))
+        topology = getattr(compiler.space, "topology_enabled", False)
+        if topology != self.config["joint_topology"]:
+            raise ValueError("joint_topology configuration must match the design-space schema")
+        if policy is None:
+            hardware = (TopologyHardwarePolicy(compiler.space, self.config["hardware_std"],
+                                               tuple(self.config["hardware_hidden_dims"]),
+                                               self.config["topology_initial_active_probability"])
+                        if topology else HardwarePolicy(compiler.space.dim, self.config["hardware_std"], initial))
+            policy = JointPolicy(None, hardware)
+        self.policy = policy
         self.policy.to(self.device)
-        if self.config["hardware_sampling_mode"] == "fixed" and initial is not None:
+        if self.config["hardware_sampling_mode"] == "fixed" and initial is not None and not topology:
             with torch.no_grad():
                 self.policy.hardware.mean.copy_(torch.as_tensor(initial, device=self.device, dtype=self.policy.hardware.mean.dtype).atanh())
         self._hardware_prior_state = {key: value.detach().clone() for key, value in self.policy.hardware.state_dict().items()}
@@ -191,10 +208,19 @@ class CodesignRunner:
 
     def _validate_config(self):
         c = self.config
+        if not isinstance(c["joint_topology"], bool):
+            raise ValueError("joint_topology must be a boolean")
+        if c["joint_topology"] and c.get("training_schedule") != "coadaptation":
+            raise ValueError("joint_topology currently requires training_schedule='coadaptation'")
         from .mass_cost import validate_mass_cost
         validate_mass_cost(c["hardware_mass_cost_weight"], c["hardware_mass_reference_kg"])
         if c["hardware_mass_cost_weight"] > 0 and c.get("training_schedule") != "coadaptation":
             raise ValueError("hardware mass cost requires training_schedule='coadaptation'")
+        from .joint_cost import validate_joint_cost
+        validate_joint_cost(c["hardware_joint_cost_weight"])
+        if c["hardware_joint_cost_weight"] > 0 and (
+                c.get("training_schedule") != "coadaptation" or not c["joint_topology"]):
+            raise ValueError("hardware_joint_cost_weight requires coadaptation and joint_topology=True")
         if "hardware_vtrace" in c:
             if not isinstance(c["hardware_vtrace"], bool):
                 raise ValueError("hardware_vtrace must be a boolean")
@@ -267,6 +293,16 @@ class CodesignRunner:
             actor = c.get("actor_cfg") or dict(**common, hidden_dims=c["actor_hidden_dims"], obs_normalization=c["actor_obs_normalization"],
                          distribution_cfg=dict(class_name="GaussianDistribution", init_std=c["init_std"], std_type=c["std_type"]))
             critic = c.get("critic_cfg") or dict(**common, hidden_dims=c["critic_hidden_dims"], obs_normalization=c["critic_obs_normalization"])
+            if c["joint_topology"]:
+                if num_actions != 12:
+                    raise ValueError("Topology co-learning requires twelve controller actions")
+                for role, model_cfg in (("actor", actor), ("critic", critic)):
+                    if c.get(role + "_cfg") is None:
+                        model_cfg.update(class_name="draft.codesign.models:ConditionedMLPModel",
+                                         conditioning_dims=19, joint_topology=True)
+                    if (model_cfg.get("class_name") != "draft.codesign.models:ConditionedMLPModel"
+                            or model_cfg.get("conditioning_dims") != 19 or not model_cfg.get("joint_topology")):
+                        raise ValueError("Topology controllers require explicit masked ConditionedMLPModel configuration")
             self.policy.control = NativeControlPolicy.from_observation(observation, num_actions, actor, critic,
                                                                      c.get("obs_groups"),
                                                                      normalization_exclusions=c["normalization_exclusions"]).to(self.device)
@@ -279,7 +315,14 @@ class CodesignRunner:
         started = self._time()
         c = self.config
         self.policy.eval()
-        if c["hardware_sampling_mode"] == "fixed":
+        if c["hardware_sampling_mode"] == "fixed" and isinstance(self.policy.hardware, TopologyHardwarePolicy):
+            raw = self.policy.hardware.fixed_raw(c["num_designs"])
+            normalized = self.policy.hardware.decode(raw)
+            physical = self.compiler.space.denormalize(normalized.cpu().numpy())
+            with torch.no_grad():
+                logprob, _, baseline = self.policy.hardware.evaluate(raw)
+                logprob, baseline = logprob.clone(), baseline.clone()
+        elif c["hardware_sampling_mode"] == "fixed":
             physical = np.broadcast_to(np.asarray(self.compiler.space.center, dtype=np.float64),
                                        (c["num_designs"], self.compiler.space.dim)).copy()
             coordinates = self.compiler.space.normalize(physical) if hasattr(self.compiler.space, "normalize") else physical
@@ -469,6 +512,13 @@ class CodesignRunner:
         metrics["sps"] = metrics["simulated_transitions"] / max(metrics["iteration_seconds"], 1e-9)
         physical_mean = self.compiler.space.denormalize(self.policy.hardware.decode(self.policy.hardware.mean).cpu().numpy())
         std = self.policy.hardware.log_std.detach().exp().cpu().tolist()
+        if isinstance(self.policy.hardware, TopologyHardwarePolicy):
+            std[7:13] = [0.] * 6
+            probabilities = self.policy.hardware.topology_logits.detach().softmax(-1)
+            for index, probability in enumerate(probabilities.cpu().tolist()):
+                metrics[f"HardwareTopology/probability_{index:02d}"] = probability
+            metrics["HardwareTopology/entropy"] = torch.distributions.Categorical(probs=probabilities).entropy().item()
+            metrics["HardwareTopology/mean_active_joints"] = float((probabilities @ self.policy.hardware.topology_bits.sum(-1)) * 2)
         for name, mean, scale in zip(self.compiler.space.names, physical_mean, std):
             metrics["hardware_mean_" + name] = float(mean)
             metrics["hardware_latent_std_" + name] = scale
@@ -587,7 +637,8 @@ class CodesignRunner:
         """Transfer compatible nets/normalizers, starting a fresh optimization run.
 
         Sampling mode and trainability may change, including nominal controller
-        pretraining followed by joint co-design. Full-state continuation is load().
+        pretraining followed by joint co-design. Input/action shapes must already
+        match; checkpoint expansion is an offline utility. Full resume is load().
         """
         if self.phase != "boundary":
             raise RuntimeError("Warm start requires a completed update boundary")
@@ -676,6 +727,9 @@ class CodesignRunner:
                     source_value, target_value = tuple(source_value or ()), tuple(target_value or ())
                 if source_value != target_value:
                     raise ValueError(f"Native warm start changes {role} model configuration: {key}")
+            for key, default in (("conditioning_dims", 7), ("joint_topology", False)):
+                if model_cfg.get(key, default) != target_cfg.get(key, default):
+                    raise ValueError(f"Native warm start changes {role} conditioning configuration: {key}")
             dimension = sum(source_schema["observation_shapes"][group][0] for group in groups[role])
             exclusions = self.config["normalization_exclusions"].get(role, ())
             resolved = [index if index >= 0 else dimension + index for index in exclusions]
@@ -769,12 +823,19 @@ class CodesignRunner:
         mutable.update({"eval_video_interval", "eval_video_length_s", "eval_video_fps", "eval_video_width", "eval_video_height"})
         mutable.add("eval_first_update")
         mass_defaults = {"hardware_mass_cost_weight": 0., "hardware_mass_reference_kg": None}
+        joint_defaults = {"hardware_joint_cost_weight": 0.}
+        topology_defaults = dict(joint_topology=False, lock_angle_bounds={}, hardware_hidden_dims=(64, 64),
+                                 topology_initial_active_probability=.9)
         for key in set(self.config) | set(data["config"]):
             current, saved = self.config.get(key), data["config"].get(key)
             if key == "training_seed_offset" and saved is None:
                 saved = 0  # Checkpoints predating optional cohort seed offsets.
             if key in mass_defaults and key not in data["config"]:
                 saved = mass_defaults[key]
+            if key in joint_defaults and key not in data["config"]:
+                saved = joint_defaults[key]
+            if key in topology_defaults and key not in data["config"]:
+                saved = topology_defaults[key]
             if key == "hardware_vtrace" and saved is None:
                 saved = False
             if key == "hardware_vtrace_cfg" and saved is None:

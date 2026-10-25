@@ -67,6 +67,14 @@ def _compile_job(spec: dict, cache_dir: str, fingerprint: str,
     space = DesignSpace.from_dict(spec)
     root = Path(cache_dir)
     parameters = space.overrides(physical)
+    topology = parameters.pop("joint_topology", None)
+    if topology is not None:
+        from .topology_physics import apply_joint_topology
+        topology = dict(topology)
+        # An active joint has no lock angle. Canonicalization also unifies cache IDs.
+        topology["lock_angles"] = [0.0 if enabled else float(angle)
+                                   for enabled, angle in zip(topology["active"], topology["lock_angles"])]
+        parameters["joint_topology"] = topology
     design_id = _digest({"compiler": fingerprint, "parameters": parameters})
     destination = root / design_id
 
@@ -103,7 +111,10 @@ def _compile_job(spec: dict, cache_dir: str, fingerprint: str,
         with (stage / "generation.log").open("w") as log, redirect_stdout(log):
             try:
                 RobotGenerator(repo_root() / "src/draft/robots/quadruped").generate(
-                    stage, params_override=parameters, strict=True)
+                    stage, params_override={k: v for k, v in parameters.items()
+                                             if k != "joint_topology"}, strict=True)
+                if topology is not None:
+                    apply_joint_topology(stage, topology)
             except FeasibilityViolation as exc:
                 error = str(exc)
         if error is not None:
@@ -159,7 +170,9 @@ class DesignCompiler:
     @staticmethod
     def source_fingerprint() -> str:
         root = repo_root()
-        inputs = [root / "src/draft/codesign/compiler.py"]
+        inputs = [root / "src/draft/codesign/compiler.py",
+                  root / "src/draft/codesign/topology_physics.py",
+                  root / "src/draft/codesign/topology.py"]
         for name in ("generation", "trends", "robots/quadruped"):
             inputs.extend(p for p in (root / "src/draft" / name).rglob("*")
                           if p.is_file() and p.suffix in {".py", ".yaml", ".json", ".xml"})
@@ -172,10 +185,32 @@ class DesignCompiler:
 
     def compile_many(self, physical: Sequence[Sequence[float]]) -> list[CompilationResult]:
         values = np.asarray(physical, dtype=np.float64)
-        if values.ndim != 2 or values.shape[1] != self.space.dim or not len(values):
+        if (values.ndim != 2 or values.shape[1] != self.space.dim or not len(values)
+                or not np.isfinite(values).all()):
             raise ValueError("A nonempty [designs, dimensions] physical batch is required")
         # Validate before any worker or filesystem side effects.
-        self.space.normalize(values)
+        rejected = {}
+        if self.space.topology_enabled:
+            if not np.isin(values[:, 7:13], (0., 1.)).all():
+                raise ValueError("Topology active masks must be binary")
+            # Out-of-range lock requests are ordinary rejected hardware draws.
+            # Active angle coordinates are marginalized by the design space.
+            lo, hi = np.asarray(self.space.lower)[13:], np.asarray(self.space.upper)[13:]
+            outside = ((values[:, 13:] < lo - 1e-5) | (values[:, 13:] > hi + 1e-5))
+            bad = np.any(outside & (values[:, 7:13] == 0), axis=1)
+            for index in np.flatnonzero(bad):
+                row = tuple(map(float, values[index]))
+                rejected[index] = CompilationResult(
+                    None, "Frozen joint lock angle lies outside its declared bounds",
+                    _digest({"compiler": self.fingerprint, "rejected_physical": row}))
+            # Validate geometry on every row, including rejected topology draws.
+            self.space.geometry_space().normalize(values[:, :7])
+            values = values[~bad]
+        if not len(values):
+            return [rejected[i] for i in range(len(physical))]
+        normalized = self.space.normalize(values)
+        if self.space.topology_enabled:
+            values = self.space.denormalize(normalized)
         rows = [tuple(map(float, row)) for row in values]
         unique = list(dict.fromkeys(rows))
         spec = self.space.to_dict()
@@ -197,7 +232,9 @@ class DesignCompiler:
             results = [_compile_job(spec, str(self.cache_dir), self.fingerprint, row) for row in unique]
         by_row = dict(zip(unique, results))
         self.prune({r.design_id for r in results})
-        return [by_row[row] for row in rows]
+        valid_results = iter(by_row[row] for row in rows)
+        return [rejected[i] if i in rejected else next(valid_results)
+                for i in range(len(physical))]
 
     def compile(self, physical: Sequence[float]) -> CompiledDesign:
         result = self.compile_many([physical])[0]

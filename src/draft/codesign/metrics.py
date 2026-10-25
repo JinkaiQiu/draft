@@ -38,6 +38,8 @@ _TAGS = {
     "vtrace_value_loss": "VTrace/value_loss",
     "hardware_task_score_mean": "HardwareReward/task",
     "hardware_mass_penalty_mean": "HardwareReward/mass_cost",
+    "hardware_joint_penalty_mean": "HardwareReward/joint_cost",
+    "hardware_active_joint_count_mean": "HardwareTopology/active_joint_count",
 }
 
 # Constants and redundant summaries remain available in metrics.jsonl/config.
@@ -70,12 +72,17 @@ _SUMMARY_TAGS = {
     "HardwareStaleness/before/clip_fraction": "HardwareStaleness/clip_fraction",
     "HardwareStaleness/before/sampled_ess_fraction": "HardwareStaleness/ess_fraction",
     "Controller/Cohort/interrupted_episodes": "Controller/Cohort/interrupted_episodes",
+    "HardwareTopology/entropy": "HardwareTopology/entropy",
+    "HardwareTopology/max_probability": "HardwareTopology/max_probability",
+    "HardwareTopology/mean_active_joints": "HardwareTopology/expected_active_joints",
+    "HardwareTopology/active_joint_count": "HardwareTopology/sampled_active_joints",
 }
 for _name in ("kl", "clip_fraction", "sampled_ess_fraction", "early_late_kl_gap"):
     _tag = "Controller/Staleness/Window/" + _name
     _SUMMARY_TAGS[_tag] = _tag
 _SUMMARY_TAGS.update({tag: tag for tag in tuple(_SUMMARY_TAGS.values())})
-_COMPACT_GROUPS = ("HardwareTraining/", "HardwareStaleness/", "Controller/Cohort/", "Controller/Staleness/")
+_COMPACT_GROUPS = ("HardwareTraining/", "HardwareStaleness/", "HardwareTopology/",
+                   "Controller/Cohort/", "Controller/Staleness/")
 
 
 def _summary_tag(tag):
@@ -91,11 +98,20 @@ def tensorboard_scalars(metrics: Mapping[str, float]) -> dict[str, float]:
     HardwareStd contains the Gaussian's latent standard deviations; HardwareMean
     contains decoded physical dimensions. Explicit namespaced tags take priority.
     Hardware score quality and staleness each have three summary cards; cohort
-    bookkeeping and detailed probes are available only in raw metrics.
+    bookkeeping and detailed probes are available only in raw metrics. Topology
+    has four cards; its full categorical distribution remains in raw metrics.
     """
     native_control = "controller_iterations" in metrics
-    result = {tag: value for key, value in metrics.items() if "/" in key
-              and (tag := _summary_tag(key)) is not None}
+    result = {}
+    for key, value in metrics.items():
+        if "/" in key and (tag := _summary_tag(key)) is not None:
+            if key == tag:
+                result[tag] = value
+            else:
+                result.setdefault(tag, value)
+    probability_keys = [f"HardwareTopology/probability_{index:02d}" for index in range(64)]
+    if all(key in metrics for key in probability_keys):
+        result.setdefault("HardwareTopology/max_probability", max(metrics[key] for key in probability_keys))
     for key, value in metrics.items():
         if "/" in key or key in _OMIT or native_control and key.startswith("controller_loss_"):
             continue

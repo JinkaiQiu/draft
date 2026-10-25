@@ -28,14 +28,32 @@ def test_registered_default_configuration_is_consistent():
     assert optimized.training_schedule == "coadaptation"
     assert optimized.num_steps_per_env == 64 and optimized.controller_updates_per_cycle == 4
     assert optimized.hardware_vtrace and optimized.hardware_gamma == 1.
-    assert optimized.hardware_mass_cost_weight == .05
+    assert optimized.hardware_mass_cost_weight == .5
+    assert optimized.hardware_joint_cost_weight == optimized.hardware_mass_cost_weight / 2
     assert optimized.hardware_mass_reference_kg == pytest.approx(32.63809926450245)
     assert optimized.schedule == "fixed"
     assert cfg.schedule == "adaptive"
-    assert optimized.normalization_exclusions["actor"] == tuple(range(-7, 0))
+    assert optimized.normalization_exclusions["actor"] == tuple(range(-19, 0))
+    assert optimized.joint_topology
+    assert optimized.geometry_relative_range == .15 and optimized.hardware_std == .3
+    assert optimized.lock_angle_bounds["front_knee"] == [-1.8, -.4]
+    assert optimized.warmstart_checkpoint.endswith("cheetah_model_999_topology_recommended.pt")
     assert callable(task.training_handler(cfg)) and callable(task.playback_handler(cfg))
     cfg.n_envs = 1
     with pytest.raises(ValueError, match="num_designs"):
+        codesign_config(cfg)
+
+
+def test_topology_config_uses_complete_hardware_conditioning_and_native_coadaptation():
+    cfg = get_task("quadruped").make_runner_cfg()
+    cfg.env_kwargs = dict(robot_xml="generated/cheetah/quadruped.xml")
+    cfg.codesign = dict(mode="optimize", training_schedule="coadaptation", joint_topology=True)
+    optimized = codesign_config(cfg)
+    assert optimized.joint_topology
+    assert optimized.normalization_exclusions == {role: tuple(range(-19, 0)) for role in ("actor", "critic")}
+    assert tuple(optimized.hardware_hidden_dims) == (64, 64)
+    cfg.codesign["training_schedule"] = "alternating"
+    with pytest.raises(ValueError, match="joint_topology"):
         codesign_config(cfg)
 
 

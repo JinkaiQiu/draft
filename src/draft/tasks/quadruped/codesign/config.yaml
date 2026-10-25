@@ -1,6 +1,6 @@
-# Optimized geometry is an opt-in special case of the quadruped task.
+# Symmetric geometry and joint-topology co-learning on the native quadruped task.
 task: quadruped
-run_name: cheetah_coadapt64_hw256_h1280_32x128_vtrace_mass
+run_name: cheetah_topology_coadapt_mass05_joint1
 log_dir: logs
 logger: tensorboard
 upload_model: false
@@ -13,7 +13,7 @@ max_episode_length: 25.6
 max_iterations: 1000
 save_interval: 25
 schedule: adaptive
-warmstart_checkpoint: logs/cheetah_fixed_conditioned_native/2026-10-16_18-34-42_cheetah_fixed_conditioned_native/model_999.pt
+warmstart_checkpoint: logs/warmstarts/converted/cheetah_model_999_topology_recommended.pt
 env_kwargs:
   robot_xml: generated/cheetah/quadruped.xml
   hardware_aware: true
@@ -36,6 +36,7 @@ codesign:
   hardware_vtrace_cfg: {}
   hardware_mass_cost_weight: 0.5
   hardware_mass_reference_kg: 32.63809926450245
+  hardware_joint_cost_weight: 1.0
   staleness_diagnostics: true
   staleness_probe_samples_per_design: 64
   controller_updates_per_cycle: 4
@@ -45,10 +46,20 @@ codesign:
   compiler_workers: 0
   max_cache_entries: 128
   cache_dir: generated/codesign
-  geometry_relative_range: 0.5
+  geometry_relative_range: 0.15
+  joint_topology: true
+  lock_angle_bounds:
+    front_hip_roll: [-0.25, 0.25]
+    front_hip_pitch: [0.0, 1.0]
+    front_knee: [-1.8, -0.4]
+    rear_hip_roll: [-0.25, 0.25]
+    rear_hip_pitch: [0.0, 1.0]
+    rear_knee: [-1.8, -0.4]
+  hardware_hidden_dims: [64, 64]
+  topology_initial_active_probability: 0.9
   optimize_hardware: true
   hardware_sampling_mode: stochastic
-  hardware_std: 0.5
+  hardware_std: 0.3
   hardware_loss_weight: 1.0
   hardware_target_kl: 0.02
   hardware_update_schedule: once_per_epoch
